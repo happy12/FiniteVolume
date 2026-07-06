@@ -1,0 +1,25 @@
+#ifndef FV_VERSION_H_INCLUDED
+#define FV_VERSION_H_INCLUDED
+
+#define FV_VERSION_MAJOR 0
+#define FV_VERSION_MINOR 2
+#define FV_BUILD_NUMBER  @BUILD_NUMBER@
+#define FV_BUILD_NUMBER_STR "@BUILD_NUMBER@"
+
+#define FV_VERSION_STRING "0.2." FV_BUILD_NUMBER_STR
+#define FV_VERSION_FULL   "0.2." FV_BUILD_NUMBER_STR
+
+// Narrow (UTF-8) forms, for use in C++ console output (--version).
+#define FV_PUBLISHER      "Mathieu Frégeau"
+#define FV_COPYRIGHT      "Copyright (c) 2026 Mathieu Frégeau"
+#define FV_DESCRIPTION    "2D Unstructured Finite Volume Solver"
+
+// Wide-string forms with the accented e escaped, for the .rc VERSIONINFO
+// block only (windres's StringFileInfo block is byte-oriented; \xE9 in a
+// wide literal round-trips correctly where a raw UTF-8 byte in a narrow
+// literal would not).
+#define FV_PUBLISHER_W    L"Mathieu Fr\xE9" L"geau"
+#define FV_COPYRIGHT_W    L"Copyright (c) 2026 Mathieu Fr\xE9" L"geau"
+#define FV_DESCRIPTION_W  L"2D Unstructured Finite Volume Solver"
+
+#endif // FV_VERSION_H_INCLUDED

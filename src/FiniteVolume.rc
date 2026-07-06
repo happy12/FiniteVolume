@@ -1,0 +1,40 @@
+#include <winver.h>
+#include "Version.h"
+
+// FiniteVolume application icon. Listed first so Windows Explorer picks it
+// up as the executable's primary icon.
+IDI_FINITEVOLUME ICON "../icons/favicon256.ico"
+
+// VS_VERSION_INFO -- embedded Windows version metadata, visible via
+// right-click FiniteVolume.exe -> Properties -> Details, and in Task
+// Manager's Details tab. FV_* macros come from the generated
+// build/generated/Version.h (see the Makefile's version_header target).
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    FV_VERSION_MAJOR,FV_VERSION_MINOR,0,FV_BUILD_NUMBER
+ PRODUCTVERSION FV_VERSION_MAJOR,FV_VERSION_MINOR,0,FV_BUILD_NUMBER
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 040904b0 = en-US (0x0409), Unicode codepage (0x04b0 / 1200).
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      FV_PUBLISHER_W
+            VALUE "FileDescription",  FV_DESCRIPTION_W
+            VALUE "FileVersion",      FV_VERSION_FULL
+            VALUE "InternalName",     "FiniteVolume"
+            VALUE "LegalCopyright",   FV_COPYRIGHT_W
+            VALUE "OriginalFilename", "FiniteVolume.exe"
+            VALUE "ProductName",      "FiniteVolume"
+            VALUE "ProductVersion",   FV_VERSION_FULL
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
