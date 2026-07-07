@@ -28,6 +28,7 @@
 #include "AdvectionDiffusionFVMSolver.h"
 #include "NavierStokesFVMSolver.h"
 #include "MeshReader.h"
+#include "MeshCheckReport.h"
 #include "CaseInput.h"
 #include "CflRamp.h"
 #include "Checkpoint.h"
@@ -65,6 +66,45 @@ bool is_nan_or_inf(double x) {
     std::uint64_t bits;
     std::memcpy(&bits, &x, sizeof(bits));
     return ((bits >> 52) & 0x7FF) == 0x7FF;
+}
+
+// Scans a per-cell scalar field for the first NaN/Inf value, to give a
+// divergence error a concrete location instead of just a step number.
+// Input:  field - one value per mesh cell
+// Returns: the index of the first non-finite cell, or -1 if all finite
+int find_first_non_finite(const std::vector<double>& field) {
+    for (std::size_t i = 0; i < field.size(); ++i) {
+        if (is_nan_or_inf(field[i])) return static_cast<int>(i);
+    }
+    return -1;
+}
+
+// Same as above, for a per-cell EulerState field (checks all four conserved
+// components).
+int find_first_non_finite(const std::vector<EulerState>& field) {
+    for (std::size_t i = 0; i < field.size(); ++i) {
+        const EulerState& s = field[i];
+        if (is_nan_or_inf(s.rho) || is_nan_or_inf(s.rho_u) ||
+            is_nan_or_inf(s.rho_v) || is_nan_or_inf(s.E)) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+// Formats the cell-location suffix appended to a "solver diverged" message.
+// Input:  cell_id - result of find_first_non_finite(), or -1 if no
+//                    non-finite cell was found in the field(s) checked
+//         mesh    - provides the cell's centroid for the message
+// Returns: ", first non-finite value at cell <id> (centroid x, y)", or ""
+//          if cell_id is -1
+std::string describe_divergent_cell(int cell_id, const UnstructuredMesh& mesh) {
+    if (cell_id < 0) return "";
+    const Cell& c = mesh.cells[cell_id];
+    std::ostringstream oss;
+    oss << ", first non-finite value at cell " << cell_id << " (centroid " << c.x_centroid
+        << ", " << c.y_centroid << ")";
+    return oss.str();
 }
 
 // Resolves a case-file output path (output_file/checkpoint_file/
@@ -3127,7 +3167,8 @@ bool run_diffusion(const CaseInput& case_input, UnstructuredMesh& mesh) {
     }
 
     if (diverged) {
-        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step
+                   << describe_divergent_cell(find_first_non_finite(solver.field()), mesh) << "\n";
         VtkWriter::write(case_input.output_file, mesh, solver.field(), case_input.output_precision);
         return false;
     }
@@ -3251,7 +3292,8 @@ bool run_advection_diffusion(const CaseInput& case_input, UnstructuredMesh& mesh
     }
 
     if (diverged) {
-        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step
+                   << describe_divergent_cell(find_first_non_finite(solver.field()), mesh) << "\n";
         VtkWriter::write(case_input.output_file, mesh, solver.field(), case_input.output_precision);
         return false;
     }
@@ -3484,7 +3526,8 @@ bool run_euler(const CaseInput& case_input, const UnstructuredMesh& mesh) {
     }
 
     if (diverged) {
-        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step
+                   << describe_divergent_cell(find_first_non_finite(solver.field()), mesh) << "\n";
         write_euler_fields(case_input.output_file, mesh, solver.field(), case_input.gamma, case_input.output_precision);
         return false;
     }
@@ -3739,7 +3782,8 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
     }
 
     if (diverged) {
-        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step
+                   << describe_divergent_cell(find_first_non_finite(solver.field()), mesh) << "\n";
         write_navier_stokes_fields(case_input.output_file, mesh, solver.field(), case_input.gamma,
                                     case_input.gas_constant, case_input.output_precision);
         if (tracking_wall_profile) {
@@ -3998,7 +4042,10 @@ bool run_ransSA(const CaseInput& case_input, const UnstructuredMesh& mesh) {
     }
 
     if (diverged) {
-        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        int bad_cell = find_first_non_finite(solver.field());
+        if (bad_cell < 0) bad_cell = find_first_non_finite(solver.nut_field());
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step
+                   << describe_divergent_cell(bad_cell, mesh) << "\n";
         write_ransSA_fields(case_input.output_file, mesh, solver.field(), solver.nut_field(), case_input.gamma,
                             case_input.gas_constant, case_input.mu, case_input.sa_constants,
                             case_input.output_precision);
@@ -4304,7 +4351,11 @@ bool run_ransSST(const CaseInput& case_input, const UnstructuredMesh& mesh) {
     }
 
     if (diverged) {
-        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        int bad_cell = find_first_non_finite(solver.field());
+        if (bad_cell < 0) bad_cell = find_first_non_finite(solver.k_field());
+        if (bad_cell < 0) bad_cell = find_first_non_finite(solver.omega_field());
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step
+                   << describe_divergent_cell(bad_cell, mesh) << "\n";
         write_ransSST_fields(case_input.output_file, mesh, solver.field(), solver.k_field(), solver.omega_field(),
                              case_input.gamma, case_input.gas_constant, case_input.mu, case_input.sst_limiter_variant,
                              case_input.sst_constants, wall_distance_for_output, case_input.gradient_scheme,
@@ -4525,12 +4576,16 @@ int run_main(int argc, char** argv) {
 
     if (argc >= 2 && std::string(argv[1]) == "--validate-mesh") {
         if (argc < 3) {
-            std::cerr << "Usage: " << argv[0] << " --validate-mesh <mesh_file>\n";
+            std::cerr << "Usage: " << argv[0] << " --validate-mesh <mesh_file> [<report_json_path>]\n";
             return 1;
         }
 
+        std::string report_json_path = (argc >= 4) ? argv[3] : "";
+        MeshCheckReport report(argv[2], report_json_path);
+        report.print_intro();
+
         UnstructuredMesh mesh;
-        if (!MeshReader::read(argv[2], mesh)) {
+        if (!MeshReader::read(argv[2], mesh, &report)) {
             return 1;
         }
 

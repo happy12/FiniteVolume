@@ -92,8 +92,11 @@ void compute_cell_geometry(UnstructuredMesh& mesh, int cell_index) {
 //         UnstructuredMesh::compute_geometry -- so face length is computed
 //         fresh here from node coordinates instead of relying on that field)
 // Output: none (mesh unmodified); diagnostics printed to stderr
+// 'report', if non-null, is step 2 ("Validating geometry") of
+// --validate-mesh's check -- see MeshCheckReport.h and
+// docs/mesh-validation-criteria.md for the criterion names used below.
 // Returns: true if no hard error was found (warnings do not fail the load); false otherwise
-bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
+bool validate_mesh_geometry(const UnstructuredMesh& mesh, MeshCheckReport* report) {
     bool ok = true;
 
     for (size_t i = 0; i < mesh.nodes.size(); ++i) {
@@ -102,9 +105,21 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
             std::cerr << "Error: mesh node " << i << " has a non-finite coordinate ("
                        << n.x << ", " << n.y << ")\n";
             ok = false;
+            if (report) {
+                double bad_value = std::isfinite(n.x) ? n.y : n.x;
+                report->add_issue(2, {"error", "node", (int)i, "node_coordinate_finite", bad_value});
+            }
         }
     }
-    if (!ok) return false; // cell/face geometry below is meaningless with garbage coordinates
+    if (!ok) {
+        // cell/face geometry below is meaningless with garbage coordinates
+        if (report) {
+            report->fail_step(2, {{"nodes_checked", (long long)mesh.nodes.size()},
+                                   {"cells_checked", 0},
+                                   {"faces_checked", 0}});
+        }
+        return false;
+    }
 
     // Exact-duplicate node positions (distinct indices, identical
     // coordinates) aren't fatal by themselves, but usually indicate a
@@ -121,6 +136,12 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
         if (a.x == b.x && a.y == b.y) {
             std::cerr << "Warning: mesh nodes " << order[i - 1] << " and " << order[i]
                        << " are at the same coordinate (" << a.x << ", " << a.y << ")\n";
+            if (report) {
+                // value is the *other* node sharing this coordinate, since
+                // "same position" has no single scalar measurement of its own
+                report->add_issue(2, {"warning", "node", order[i], "node_position_unique",
+                                       (double)order[i - 1]});
+            }
         }
     }
 
@@ -143,10 +164,14 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
             std::cerr << "Error: cell " << c << " has a degenerate (zero or non-finite) volume ("
                        << volume << ") -- its polygon vertices are collinear or coincident\n";
             ok = false;
+            if (report) report->add_issue(2, {"error", "cell", (int)c, "cell_volume_positive", volume});
         } else if (mean_volume > 0.0 && volume < 1e-8 * mean_volume) {
             std::cerr << "Warning: cell " << c << " has volume " << volume
                        << ", far smaller than the mesh's mean cell volume (" << mean_volume
                        << ") -- check for a near-degenerate element\n";
+            if (report) {
+                report->add_issue(2, {"warning", "cell", (int)c, "cell_volume_not_near_degenerate", volume});
+            }
         }
     }
 
@@ -176,12 +201,24 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
                        << mesh.faces[f].node2 << ") has a degenerate (zero or non-finite) length ("
                        << length << ")\n";
             ok = false;
+            if (report) report->add_issue(2, {"error", "face", (int)f, "face_length_positive", length});
         } else if (mean_length > 0.0 && length < 1e-8 * mean_length) {
             std::cerr << "Warning: face " << f << " (nodes " << mesh.faces[f].node1 << ", "
                        << mesh.faces[f].node2 << ") has length " << length
                        << ", far smaller than the mesh's mean face length (" << mean_length
                        << ") -- check for a near-degenerate element\n";
+            if (report) {
+                report->add_issue(2, {"warning", "face", (int)f, "face_length_not_near_degenerate", length});
+            }
         }
+    }
+
+    if (report) {
+        std::map<std::string, long long> counts = {{"nodes_checked", (long long)mesh.nodes.size()},
+                                                     {"cells_checked", (long long)mesh.cells.size()},
+                                                     {"faces_checked", (long long)mesh.faces.size()}};
+        if (ok) report->complete_step(2, counts, true);
+        else report->fail_step(2, counts);
     }
 
     return ok;
@@ -204,6 +241,12 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
 //         line_elements   - 1D (line) elements tagging boundary edges
 //         physical_names  - physical group id -> name, for patches
 // Output: mesh.cells/faces/patches are filled in
+// 'report', if non-null, is completed here for --validate-mesh's step 0
+// (Parsing -- 'mesh'/cell_elements/line_elements are already fully parsed by
+// the time this is called, regardless of source format) and step 1
+// (Building connectivity); step 2 (Validating geometry) is delegated to
+// validate_mesh_geometry(). See MeshCheckReport.h and
+// docs/mesh-validation-criteria.md for the criterion names used below.
 // Returns: false if any boundary face is untagged or validate_mesh_geometry()
 //          finds a degenerate (zero/non-finite volume or face length) element
 //          (a descriptive message is printed to stderr in either case);
@@ -211,7 +254,16 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
 bool build_cells_faces_patches(UnstructuredMesh& mesh,
                                 const std::vector<TempElement>& cell_elements,
                                 const std::vector<TempElement>& line_elements,
-                                const std::map<int, std::string>& physical_names) {
+                                const std::map<int, std::string>& physical_names,
+                                MeshCheckReport* report) {
+    if (report) {
+        report->complete_step(0,
+                               {{"nodes", (long long)mesh.nodes.size()},
+                                {"cells", (long long)cell_elements.size()},
+                                {"boundary_edges", (long long)line_elements.size()}},
+                               true);
+    }
+
     // --- Build cells and derive faces from shared edges ---
     // edge_to_face maps an (unordered) node-index pair to the face it has
     // already produced, so that the second cell to visit a shared edge links
@@ -264,11 +316,13 @@ bool build_cells_faces_patches(UnstructuredMesh& mesh,
     // and stamp that face with the (lazily created) patch index for its
     // physical group.
     std::map<int, int> physical_id_to_patch; // physical id -> mesh.patches index
+    int tagged_count = 0;
     for (const auto& elem : line_elements) {
         auto key = std::make_pair(std::min(elem.node_ids[0], elem.node_ids[1]),
                                    std::max(elem.node_ids[0], elem.node_ids[1]));
         auto face_it = edge_to_face.find(key);
         if (face_it == edge_to_face.end()) continue; // edge not part of any cell boundary
+        ++tagged_count;
 
         int patch_index;
         auto patch_it = physical_id_to_patch.find(elem.physical_id);
@@ -301,10 +355,37 @@ bool build_cells_faces_patches(UnstructuredMesh& mesh,
         std::cerr << "Error: mesh has " << untagged_count << " boundary faces with no assigned "
                      "patch (untagged boundary edges). Every boundary face must belong to a "
                      "tagged patch.\n";
+        const int max_listed = 10;
+        int listed = 0;
+        for (size_t f = 0; f < mesh.faces.size() && listed < max_listed; ++f) {
+            const Face& face = mesh.faces[f];
+            if (face.cell_right != -1 || face.patch_id != -1) continue;
+            const Node& n1 = mesh.nodes[face.node1];
+            const Node& n2 = mesh.nodes[face.node2];
+            std::cerr << "  face " << f << ": node " << face.node1 << " (" << n1.x << ", " << n1.y
+                      << ") -- node " << face.node2 << " (" << n2.x << ", " << n2.y << ")\n";
+            if (report) {
+                report->add_issue(1, {"error", "face", (int)f, "boundary_face_tagged", (double)face.patch_id});
+            }
+            ++listed;
+        }
+        if (untagged_count > listed) {
+            std::cerr << "  ... and " << (untagged_count - listed) << " more\n";
+        }
+        if (report) {
+            report->fail_step(1, {{"faces_derived", (long long)mesh.faces.size()},
+                                   {"boundary_edges_tagged", (long long)tagged_count}});
+        }
         return false;
     }
+    if (report) {
+        report->complete_step(1,
+                               {{"faces_derived", (long long)mesh.faces.size()},
+                                {"boundary_edges_tagged", (long long)tagged_count}},
+                               true);
+    }
 
-    if (!validate_mesh_geometry(mesh)) {
+    if (!validate_mesh_geometry(mesh, report)) {
         return false;
     }
 
@@ -318,7 +399,7 @@ bool build_cells_faces_patches(UnstructuredMesh& mesh,
 // Input:  in   - open input stream, positioned at offset 0
 // Output: mesh - populated with nodes, faces, cells and boundary patches
 // Returns: true on success; false if the file contains no nodes/cells.
-bool read_gmsh_v22(std::ifstream& in, UnstructuredMesh& mesh) {
+bool read_gmsh_v22(std::ifstream& in, UnstructuredMesh& mesh, MeshCheckReport* report) {
     std::unordered_map<int, int> node_id_to_index; // gmsh node id -> mesh.nodes index
     std::map<int, std::string> physical_names;      // physical id -> name (dimension 1 only)
     std::vector<TempElement> cell_elements;          // triangles/quads
@@ -400,7 +481,13 @@ bool read_gmsh_v22(std::ifstream& in, UnstructuredMesh& mesh) {
                 for (int k = 0; k < node_count; ++k) {
                     int nid;
                     iss >> nid;
-                    elem.node_ids[k] = node_id_to_index.at(nid);
+                    auto nid_it = node_id_to_index.find(nid);
+                    if (nid_it == node_id_to_index.end()) {
+                        std::cerr << "Error reading mesh: $Elements entry " << elm_number << " (vertex "
+                                  << k << ") references undefined node id " << nid << "\n";
+                        return false;
+                    }
+                    elem.node_ids[k] = nid_it->second;
                 }
 
                 if (elm_type == 1) line_elements.push_back(std::move(elem));
@@ -414,7 +501,7 @@ bool read_gmsh_v22(std::ifstream& in, UnstructuredMesh& mesh) {
         return false;
     }
 
-    return build_cells_faces_patches(mesh, cell_elements, line_elements, physical_names);
+    return build_cells_faces_patches(mesh, cell_elements, line_elements, physical_names, report);
 }
 
 // Reads a Gmsh ASCII format 4.x mesh from an already-open stream (positioned
@@ -438,7 +525,7 @@ bool read_gmsh_v22(std::ifstream& in, UnstructuredMesh& mesh) {
 // Returns: true on success; false if the file contains no nodes/cells, or
 //          uses a feature this reader does not support (parametric node
 //          coordinates; a stderr message is printed in that case).
-bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh) {
+bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh, MeshCheckReport* report) {
     std::unordered_map<long long, int> node_id_to_index; // gmsh node tag -> mesh.nodes index
     std::map<int, std::string> physical_names;            // physical id -> name (dimension 1 only)
     std::vector<TempElement> cell_elements;               // triangles/quads
@@ -586,7 +673,14 @@ bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh) {
                     for (int k = 0; k < node_count; ++k) {
                         long long nid;
                         iss >> nid;
-                        elem.node_ids[k] = node_id_to_index.at(nid);
+                        auto nid_it = node_id_to_index.find(nid);
+                        if (nid_it == node_id_to_index.end()) {
+                            std::cerr << "Error reading mesh: $Elements entry " << element_tag
+                                      << " (entity dim " << entity_dim << " tag " << entity_tag << ", vertex "
+                                      << k << ") references undefined node id " << nid << "\n";
+                            return false;
+                        }
+                        elem.node_ids[k] = nid_it->second;
                     }
 
                     if (elm_type == 1) line_elements.push_back(std::move(elem));
@@ -601,7 +695,7 @@ bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh) {
         return false;
     }
 
-    return build_cells_faces_patches(mesh, cell_elements, line_elements, physical_names);
+    return build_cells_faces_patches(mesh, cell_elements, line_elements, physical_names, report);
 }
 
 } // namespace
@@ -624,7 +718,7 @@ bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh) {
 // an internal face. Edges visited by only one cell remain boundary faces
 // (cell_right == -1). Finally, the explicit boundary line elements are matched
 // back to these boundary faces by the same node-pair key, to assign patch_id.
-bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh) {
+bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh, MeshCheckReport* report) {
     std::ifstream in(filename);
     if (!in.is_open()) {
         std::cerr << "Error: could not open mesh file '" << filename << "'\n";
@@ -647,10 +741,10 @@ bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh) 
     in.seekg(0); // both parsers re-scan the file from the top by section tag
 
     if (version == 2.2) {
-        return read_gmsh_v22(in, mesh);
+        return read_gmsh_v22(in, mesh, report);
     }
     if (version >= 4.0) {
-        return read_gmsh_v41(in, mesh);
+        return read_gmsh_v41(in, mesh, report);
     }
 
     std::cerr << "Error in mesh file '" << filename << "': unsupported Gmsh format version "
@@ -665,7 +759,7 @@ bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh) 
 // appearance of each patch_name) before handing off to the same
 // build_cells_faces_patches() the Gmsh readers use -- that function is
 // otherwise completely format-agnostic.
-bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh) {
+bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh, MeshCheckReport* report) {
     std::ifstream in(filename);
     if (!in.is_open()) {
         std::cerr << "Error: could not open mesh file '" << filename << "'\n";
@@ -709,7 +803,9 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
     std::unordered_map<std::string, int> patch_name_to_id;
 
     std::string line;
+    int line_number = 1; // the '# FVMESH ...' header line already consumed above
     while (std::getline(in, line)) {
+        ++line_number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
 
@@ -742,8 +838,8 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
                     int idx;
                     in >> idx;
                     if (idx < 0 || (size_t)idx >= mesh.nodes.size()) {
-                        std::cerr << "Error in mesh file '" << filename
-                                  << "': CELLS entry references out-of-range node index " << idx << "\n";
+                        std::cerr << "Error in mesh file '" << filename << "': CELLS entry " << i
+                                  << " (vertex " << k << ") references out-of-range node index " << idx << "\n";
                         return false;
                     }
                     elem.node_ids[k] = idx;
@@ -759,8 +855,10 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
                 std::string patch_name;
                 in >> a >> b >> patch_name;
                 if (a < 0 || (size_t)a >= mesh.nodes.size() || b < 0 || (size_t)b >= mesh.nodes.size()) {
-                    std::cerr << "Error in mesh file '" << filename
-                              << "': BOUNDARY entry references out-of-range node index\n";
+                    int bad = (a < 0 || (size_t)a >= mesh.nodes.size()) ? a : b;
+                    std::cerr << "Error in mesh file '" << filename << "': BOUNDARY entry " << i
+                              << " (patch '" << patch_name << "') references out-of-range node index "
+                              << bad << "\n";
                     return false;
                 }
 
@@ -782,7 +880,8 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
             }
             std::getline(in, line); // consume rest of the last boundary line
         } else {
-            std::cerr << "Error in mesh file '" << filename << "': unrecognized section '" << tag << "'\n";
+            std::cerr << "Error in mesh file '" << filename << "' at line " << line_number
+                      << ": unrecognized section '" << tag << "'\n";
             return false;
         }
     }
@@ -792,26 +891,35 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
         return false;
     }
 
-    return build_cells_faces_patches(mesh, cell_elements, line_elements, physical_names);
+    return build_cells_faces_patches(mesh, cell_elements, line_elements, physical_names, report);
 }
 
 // See MeshReader.h for the input/output contract. Dispatches purely on
 // 'filename's extension -- no content sniffing, unlike read_gmsh's internal
 // version detection, since the two formats' extensions are unambiguous.
-bool MeshReader::read(const std::string& filename, UnstructuredMesh& mesh) {
+bool MeshReader::read(const std::string& filename, UnstructuredMesh& mesh, MeshCheckReport* report) {
     auto has_extension = [&](const std::string& ext) {
         return filename.size() >= ext.size() &&
                filename.compare(filename.size() - ext.size(), ext.size(), ext) == 0;
     };
 
+    bool ok;
     if (has_extension(".msh")) {
-        return read_gmsh(filename, mesh);
-    }
-    if (has_extension(".fvmesh")) {
-        return read_fvmesh(filename, mesh);
+        ok = read_gmsh(filename, mesh, report);
+    } else if (has_extension(".fvmesh")) {
+        ok = read_fvmesh(filename, mesh, report);
+    } else {
+        std::cerr << "Error in mesh file '" << filename
+                  << "': unrecognized extension (expected .msh or .fvmesh)\n";
+        ok = false;
     }
 
-    std::cerr << "Error in mesh file '" << filename
-              << "': unrecognized extension (expected .msh or .fvmesh)\n";
-    return false;
+    // If parsing failed before reaching build_cells_faces_patches (which
+    // completes/fails report's Parsing step itself once it has real
+    // counts), report's Parsing step is still "pending" -- fail_step() is a
+    // no-op otherwise, so this is a safe unconditional fallback.
+    if (!ok && report) {
+        report->fail_step(0, {});
+    }
+    return ok;
 }
