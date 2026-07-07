@@ -9,7 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -ffast-math")
 
 # Single output location regardless of config, matching the Makefile. Ninja
 # Multi-Config appends a per-config subdirectory unless the per-config
@@ -42,6 +42,18 @@ add_dependencies(FiniteVolume version_header)
 
 target_include_directories(FiniteVolume PRIVATE ${CMAKE_SOURCE_DIR}/include ${GENERATED_DIR})
 target_compile_options(FiniteVolume PRIVATE -Wall -Wextra -fopenmp)
+
+# Release-only cross-TU inlining -- e.g. GradientReconstruction.cpp's
+# face_gradient() called from AdvectionDiffusionFVMSolver.cpp/
+# NavierStokesFVMSolver.cpp's hot per-face loops, which per-TU compilation
+# can't inline across. INTERPROCEDURAL_OPTIMIZATION_RELEASE (rather than a
+# plain -flto compile/link flag) lets CMake pair the compile+link flags
+# itself and only if the toolchain actually supports it.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported)
+if(ipo_supported)
+    set_target_properties(FiniteVolume PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
 
 # -I lets windres find the generated Version.h; OBJECT_DEPENDS makes the
 # resource recompile whenever the icon or the version header changes.

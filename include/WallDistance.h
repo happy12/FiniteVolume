@@ -13,10 +13,10 @@
 //
 // This is the wall-distance field the SA turbulence model's destruction
 // term needs (see docs/archive/rans-spalart-allmaras-tracker.md Phase 1/2). Kept
-// mesh-geometry-only, with no dependency on RANSFVMSolver or NSBoundaryType,
+// mesh-geometry-only, with no dependency on RANSTurbulenceSASolver or NSBoundaryType,
 // since it depends only on which faces are walls, not on any flow field --
 // same reasoning as GradientCalculator's precomputed Least-Squares matrix
-// (see GradientReconstruction.h). A future RANSFVMSolver just needs to hand
+// (see GradientReconstruction.h). A future RANSTurbulenceSASolver just needs to hand
 // it the indices of whichever faces have NSBoundaryType::NoSlipWall.
 //
 // Methodology: brute-force O(cells * wall_face_indices.size()) point-to-

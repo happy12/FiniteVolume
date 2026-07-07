@@ -140,7 +140,7 @@ FaceGradient face_gradient(const UnstructuredMesh& mesh, const Face& face, doubl
 // that's the component whose accuracy actually matters for avoiding
 // checkerboard decoupling (see docs/navier-stokes-tracker.md Phase 1). A
 // viscous stress tensor's off-diagonal/tangential terms (NavierStokesFVMSolver,
-// RANSFVMSolver, and WallTraction.h) need the full 2D gradient vector, though,
+// RANSTurbulenceSASolver, and WallTraction.h) need the full 2D gradient vector, though,
 // hence this correction.
 //
 // Input:  fg     - a face's FaceGradient (see face_gradient() above)

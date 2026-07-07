@@ -140,6 +140,11 @@ public:
         last_residual = EulerResidualNorms{};
     }
 
+    // Overwrites the CFL number compute_dt() uses on the next step() call --
+    // e.g. for residual-based CFL ramping (see CflRamp.h/main.cpp's cfl_mode
+    // handling). Takes effect starting with the next step(), not retroactively.
+    void set_cfl(double new_cfl) { cfl = new_cfl; }
+
     // Estimates, from the CURRENT flow field, how well the mesh resolves the
     // smallest (Kolmogorov) length scale of the local strain field --
     // meant as a resolution-adequacy diagnostic for treating a run as a
@@ -176,7 +181,7 @@ public:
     // compute_resolution_diagnostics(): u/v/T, boundary fields, and
     // gradients are all recomputed fresh here. effective_viscosity is
     // uniform mu, since this solver has no turbulence closure (see
-    // RANSFVMSolver for the mu + rho*nu_t analogue).
+    // RANSTurbulenceSASolver for the mu + rho*nu_t analogue).
     //
     // Input:  wall_faces - indices into mesh.faces to sample; every entry
     //         should be a boundary face whose patch's NSBoundaryType is

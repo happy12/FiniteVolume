@@ -34,12 +34,12 @@ SASourceTerms compute_sa_source_terms(double nut, double nu, double omega, doubl
     double d2 = wall_distance * wall_distance;
     double s_bar = (nut / (c.kappa * c.kappa * d2)) * fv2;
 
-    // Negative-S~ robustness fix (Spalart & Allmaras 1994): s_bar is
+    // Negative-S~ robustness fix (Allmaras, Johnson & Spalart 2012, ICCFD7-1902): s_bar is
     // negative for a wide range of chi (fv2 itself is negative roughly for
     // chi in [1, 18]), and the plain omega + s_bar formula can drive S~
     // negative or even flip production's sign when omega is small -- see
     // SpalartAllmaras.h's methodology comment for the exact case this was
-    // added to fix (a real divergence in a coupled RANSFVMSolver run).
+    // added to fix (a real divergence in a coupled RANSTurbulenceSASolver run).
     double s_tilde;
     if (s_bar >= -c.cv2 * omega) {
         s_tilde = omega + s_bar;

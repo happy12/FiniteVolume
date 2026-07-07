@@ -2,14 +2,18 @@
 #include <algorithm>
 #include <cmath>
 #include <csignal>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <exception>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #ifdef _OPENMP
 #include <omp.h>
@@ -25,13 +29,16 @@
 #include "NavierStokesFVMSolver.h"
 #include "MeshReader.h"
 #include "CaseInput.h"
+#include "CflRamp.h"
 #include "Checkpoint.h"
 #include "VtkWriter.h"
 #include "GradientReconstruction.h"
 #include "WallDistance.h"
 #include "WallTraction.h"
 #include "SpalartAllmaras.h"
-#include "RANSFVMSolver.h"
+#include "RANSTurbulenceSASolver.h"
+#include "SSTKOmega.h"
+#include "RANSTurbulenceSSTSolver.h"
 #include "Version.h"
 
 namespace {
@@ -44,6 +51,21 @@ namespace {
 // handler does nothing else (no I/O, no allocation).
 volatile sig_atomic_t g_interrupt_requested = 0;
 void handle_sigint(int) { g_interrupt_requested = 1; }
+
+// Divergence checks below use this instead of std::isnan(x) || std::isinf(x)
+// because -ffast-math (specifically -ffinite-math-only, which it implies)
+// permits the compiler to assume no value is ever NaN/Inf and fold those
+// calls to a constant false, silently deleting the check. This project's
+// build doesn't enable -ffast-math today, but the check should not depend on
+// that staying true. Testing the exponent bits directly is pure integer
+// logic -- IEEE 754 double: NaN and Inf are exactly the values whose 11-bit
+// exponent field is all 1s -- so there's no floating-point comparison for
+// the compiler to reason about away.
+bool is_nan_or_inf(double x) {
+    std::uint64_t bits;
+    std::memcpy(&bits, &x, sizeof(bits));
+    return ((bits >> 52) & 0x7FF) == 0x7FF;
+}
 
 // Resolves a case-file output path (output_file/checkpoint_file/
 // residual_file) against scratch_dir, so relative paths can be redirected to
@@ -82,6 +104,94 @@ void ensure_parent_directory(const std::string& path) {
         std::error_code ec;
         std::filesystem::create_directories(parent, ec);
     }
+}
+
+// Computes the Levenshtein (single-character insert/delete/substitute) edit
+// distance between two strings. Used by validate_boundary_condition_specs()
+// below to suggest the closest actual mesh patch name for a typo'd one.
+// Input:  a, b - the two strings to compare
+// Returns: the minimum number of single-character edits to turn a into b
+int levenshtein_distance(const std::string& a, const std::string& b) {
+    std::vector<std::vector<int>> dp(a.size() + 1, std::vector<int>(b.size() + 1));
+    for (size_t i = 0; i <= a.size(); ++i) dp[i][0] = (int)i;
+    for (size_t j = 0; j <= b.size(); ++j) dp[0][j] = (int)j;
+    for (size_t i = 1; i <= a.size(); ++i) {
+        for (size_t j = 1; j <= b.size(); ++j) {
+            if (a[i - 1] == b[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1];
+            } else {
+                dp[i][j] = 1 + std::min({dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]});
+            }
+        }
+    }
+    return dp[a.size()][b.size()];
+}
+
+// Validates a case file's per-equation-set boundary condition specs
+// (BoundaryConditionSpec/EulerBoundaryConditionSpec/NSBoundaryConditionSpec/
+// RANSBoundaryConditionSpecSA/RANSBoundaryConditionSpecSST -- anything with a
+// 'patch_name' member) against the mesh's actual patches, before each
+// run_*() function's own per-patch matching loop runs. That loop only walks
+// mesh patches looking for a matching spec, so on its own it silently
+// swallows two case-file mistakes: a "boundary <name> ..." entry whose
+// <name> matches no mesh patch at all (never even looked at), and two
+// "boundary <name> ..." entries for the same patch (the first one silently
+// wins, since the loop takes the first match and breaks).
+//
+// Input:  specs        - the case file's boundary condition specs for the
+//                         active equation set
+//         mesh_patches - the mesh's actual boundary patches
+// Output: none; a descriptive message is printed to stderr per mistake found
+//         (an unmatched patch name gets a "did you mean '<closest>'?"
+//         suggestion, using Levenshtein distance against every mesh patch
+//         name)
+// Returns: true if every spec names a distinct, existing mesh patch; false otherwise
+template <typename BCSpec>
+bool validate_boundary_condition_specs(const std::vector<BCSpec>& specs,
+                                        const std::vector<BoundaryPatch>& mesh_patches) {
+    bool ok = true;
+
+    std::unordered_map<std::string, int> spec_count;
+    for (const auto& spec : specs) {
+        ++spec_count[spec.patch_name];
+    }
+    for (const auto& [name, count] : spec_count) {
+        if (count > 1) {
+            std::cerr << "Error in case file: patch '" << name << "' has " << count
+                       << " boundary conditions specified (expected exactly one)\n";
+            ok = false;
+        }
+    }
+
+    for (const auto& spec : specs) {
+        bool found = false;
+        for (const auto& patch : mesh_patches) {
+            if (patch.name == spec.patch_name) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std::string closest;
+            int closest_distance = -1;
+            for (const auto& patch : mesh_patches) {
+                int d = levenshtein_distance(spec.patch_name, patch.name);
+                if (closest_distance < 0 || d < closest_distance) {
+                    closest_distance = d;
+                    closest = patch.name;
+                }
+            }
+            std::cerr << "Error in case file: boundary condition specified for patch '" << spec.patch_name
+                       << "', which does not exist in the mesh";
+            if (!closest.empty()) {
+                std::cerr << " (did you mean '" << closest << "'?)";
+            }
+            std::cerr << "\n";
+            ok = false;
+        }
+    }
+
+    return ok;
 }
 
 // Builds a per-step snapshot filename by inserting a zero-padded step number
@@ -124,7 +234,7 @@ double mesh_bounding_box_diagonal(const UnstructuredMesh& mesh) {
 // Collects the indices of every boundary face whose patch's NSBoundaryType is
 // NoSlipWall, for WallTraction.h's compute_wall_traction_samples() /
 // compute_boundary_layer_profiles() -- identical purpose to
-// RANSFVMSolver.cpp's own private collect_wall_faces(), duplicated here since
+// RANSTurbulenceSASolver.cpp's own private collect_wall_faces(), duplicated here since
 // that one isn't reachable from main.cpp.
 std::vector<int> collect_wall_faces(const UnstructuredMesh& mesh, const std::vector<NSBoundaryCondition>& bcs) {
     std::vector<int> wall_faces;
@@ -137,8 +247,20 @@ std::vector<int> collect_wall_faces(const UnstructuredMesh& mesh, const std::vec
     return wall_faces;
 }
 
-// RANS overload: identical purpose, indexed by RANSBoundaryCondition::ns.type instead.
-std::vector<int> collect_wall_faces(const UnstructuredMesh& mesh, const std::vector<RANSBoundaryCondition>& bcs) {
+// RANS overload: identical purpose, indexed by RANSBoundaryConditionSA::ns.type instead.
+std::vector<int> collect_wall_faces(const UnstructuredMesh& mesh, const std::vector<RANSBoundaryConditionSA>& bcs) {
+    std::vector<int> wall_faces;
+    for (size_t i = 0; i < mesh.faces.size(); ++i) {
+        const Face& face = mesh.faces[i];
+        if (face.cell_right == -1 && bcs.at(face.patch_id).ns.type == NSBoundaryType::NoSlipWall) {
+            wall_faces.push_back((int)i);
+        }
+    }
+    return wall_faces;
+}
+
+// RANS (k-omega SST) overload: identical purpose, indexed by RANSBoundaryConditionSST::ns.type instead.
+std::vector<int> collect_wall_faces(const UnstructuredMesh& mesh, const std::vector<RANSBoundaryConditionSST>& bcs) {
     std::vector<int> wall_faces;
     for (size_t i = 0; i < mesh.faces.size(); ++i) {
         const Face& face = mesh.faces[i];
@@ -606,7 +728,7 @@ bool run_verify_flat_plate_boundary_layer() {
 
     EulerState freestream = from_primitive(rho_inf, u_inf, 0.0, p_inf, gamma);
 
-    std::vector<RANSBoundaryCondition> bcs(mesh.patches.size());
+    std::vector<RANSBoundaryConditionSA> bcs(mesh.patches.size());
     bcs[0].ns.type = NSBoundaryType::NoSlipWall; // bottom: the plate
     bcs[1].ns.type = NSBoundaryType::Farfield;   // left: inlet
     bcs[1].ns.farfield_state = freestream;
@@ -620,7 +742,7 @@ bool run_verify_flat_plate_boundary_layer() {
     ic.mode = EulerICMode::Freestream;
     ic.rho = rho_inf; ic.u = u_inf; ic.v = 0.0; ic.p = p_inf;
 
-    RANSFVMSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, initial_nut,
+    RANSTurbulenceSASolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, initial_nut,
                           NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares, 1e-6, 20);
 
     std::cout << "Flat-plate boundary-layer verification: " << n_x << "x" << n_y << " stretched mesh ("
@@ -632,7 +754,7 @@ bool run_verify_flat_plate_boundary_layer() {
         solver.step();
         const EulerResidualNorms& r = solver.residual();
         double nr = solver.nut_residual();
-        if (std::isnan(r.rho_u) || std::isinf(r.rho_u) || std::isnan(nr) || std::isinf(nr)) {
+        if (is_nan_or_inf(r.rho_u) || is_nan_or_inf(nr)) {
             std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
             return false;
         }
@@ -730,7 +852,7 @@ bool run_verify_flat_plate_boundary_layer() {
 
     // Mirrors NavierStokesFVMSolver::build_boundary_fields()'s Dirichlet
     // (NoSlipWall)/zero-order-extrapolation (Farfield/Outflow) convention;
-    // RANSFVMSolver's own build_boundary_fields() is private and unreachable
+    // RANSTurbulenceSASolver's own build_boundary_fields() is private and unreachable
     // from here. NoSlipWall entries are left at 0.0 -- this plate is
     // stationary and adiabatic.
     std::vector<double> boundary_u(mesh.faces.size(), 0.0), boundary_v(mesh.faces.size(), 0.0);
@@ -805,6 +927,285 @@ bool run_verify_flat_plate_boundary_layer() {
                   "and match the Blasius/Pohlhausen closed-form Cf/thickness-ratio values.\n";
 
     return passed && general_bl_passed;
+}
+
+// Runs Phase 4 of the SST tracker's own verification gate
+// (docs/sst-komega-tracker.md), mirroring run_verify_flat_plate_boundary_layer()'s
+// exact setup (same L/H/n_x/first_cell_height/growth_ratio/Re_L/rho_inf/
+// p_inf/u_inf, for a direct apples-to-apples comparison against SA on the
+// identical mesh/Reynolds number) but substituting RANSTurbulenceSSTSolver.
+//
+// Per this tracker's own "Planned methodology": monitors nu_t/nu's trend at
+// the exit-station near-wall cell every 'nu_t_check_interval' steps
+// throughout the run (growing = sustaining turbulence, decaying/flat = the
+// same laminar-decay signature SA's own two real attempts already found at
+// this Re_L) rather than assuming the outcome and skipping straight to one
+// comparison target. Whichever signature is actually observed decides which
+// comparison runs at the end: the turbulent log-law
+// (u+ = ln(y+)/kappa + B) if nu_t/nu is growing, or the laminar Pohlhausen
+// quartic profile (same methodology as run_verify_flat_plate_boundary_layer(),
+// delta_99 taken from this run's own exit-station profile) if it isn't --
+// this is a genuine, quantitative comparison either way, just against
+// whichever target the model's own observed behavior actually warrants.
+//
+// One SSTLimiterVariant only (Vorticity) -- if k/nu_t decays to numerically
+// negligible regardless of which limiter formula is used (as Phase 2's own
+// Couette stability check already found), the choice of limiter can't
+// matter to the outcome; this is a single validation attempt, not a second
+// full sweep across both variants.
+//
+// Input:  none
+// Output: prints the nu_t/nu trend at each check interval, the exit-station
+//         diagnostics, and whichever profile comparison was selected
+// Returns: true if the run completes without diverging and the selected
+//          comparison passes its own tolerance (same contract/tolerances as
+//          run_verify_flat_plate_boundary_layer() for whichever target applies)
+bool run_verify_sst_flat_plate() {
+    const double L = 1.0, H = 0.2;
+    const int n_x = 40;
+    const double first_cell_height = 2.949e-3;
+    const double growth_ratio = 1.15;
+
+    const double gamma = 1.4, gas_constant = 1.0, prandtl = 0.72, prandtl_t = 0.9, cfl = 0.3;
+    const double rho_inf = 1.0, p_inf = 1.0, u_inf = 0.2;
+    const double Re_L = 1.0e4;
+    const double mu = rho_inf * u_inf * L / Re_L;
+    const double nu = mu / rho_inf;
+
+    // Freestream nu_t/nu = 3, matching run_verify_flat_plate_boundary_layer()'s
+    // initial_nut convention exactly (k/omega chosen so nu_t ~ k/omega = 3*nu
+    // when the eddy-viscosity limiter isn't binding at this modest freestream
+    // shear); Tu = 5% is only what SETS k's own scale, not independently
+    // load-bearing for this comparison.
+    const double freestream_Tu = 0.05, freestream_ratio = 3.0;
+    const double initial_k = 1.5 * (freestream_Tu * u_inf) * (freestream_Tu * u_inf);
+    const double initial_omega = initial_k / (freestream_ratio * nu);
+
+    const int nsteps = 20000;
+    const int nu_t_check_interval = 2000;
+
+    UnstructuredMesh mesh;
+    int n_y = build_flat_plate_mesh(mesh, n_x, L, H, first_cell_height, growth_ratio);
+    mesh.compute_geometry();
+
+    EulerState freestream = from_primitive(rho_inf, u_inf, 0.0, p_inf, gamma);
+
+    std::vector<RANSBoundaryConditionSST> bcs(mesh.patches.size());
+    bcs[0].ns.type = NSBoundaryType::NoSlipWall; // bottom: the plate
+    bcs[1].ns.type = NSBoundaryType::Farfield;   // left: inlet
+    bcs[1].ns.farfield_state = freestream;
+    bcs[1].farfield_k = initial_k;
+    bcs[1].farfield_omega = initial_omega;
+    bcs[2].ns.type = NSBoundaryType::Farfield;   // top: undisturbed freestream
+    bcs[2].ns.farfield_state = freestream;
+    bcs[2].farfield_k = initial_k;
+    bcs[2].farfield_omega = initial_omega;
+    bcs[3].ns.type = NSBoundaryType::Outflow;    // right: outlet
+
+    EulerInitialCondition ic;
+    ic.mode = EulerICMode::Freestream;
+    ic.rho = rho_inf; ic.u = u_inf; ic.v = 0.0; ic.p = p_inf;
+
+    RANSTurbulenceSSTSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, initial_k,
+                                     initial_omega, NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares, 1e-6,
+                                     20, SSTLimiterVariant::Vorticity);
+
+    std::cout << "SST flat-plate boundary-layer verification: " << n_x << "x" << n_y << " stretched mesh ("
+               << mesh.cells.size() << " cells), Re_L = " << Re_L << ", first cell height = "
+               << (mesh.cells[0].y_centroid * 2.0) << ", initial k = " << initial_k << ", initial omega = "
+               << initial_omega << " (nu_t/nu = " << freestream_ratio << ")\n";
+
+    int wall_cell = (n_x - 1); // (i=n_x-1, j=0) -- the exit-station near-wall cell
+    double last_nu_t_ratio = -1.0;
+    bool nu_t_growing = false;
+
+    int last_step = 0;
+    for (; last_step < nsteps; ++last_step) {
+        solver.step();
+        const EulerResidualNorms& r = solver.residual();
+        double kr = solver.k_residual();
+        double wr = solver.omega_residual();
+        if (is_nan_or_inf(r.rho_u) || is_nan_or_inf(kr) || is_nan_or_inf(wr)) {
+            std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
+            return false;
+        }
+
+        if ((last_step + 1) % nu_t_check_interval == 0) {
+            const std::vector<double>& k_field = solver.k_field();
+            const std::vector<double>& omega_field = solver.omega_field();
+            const std::vector<EulerState>& field = solver.field();
+            double nu_lam_wall = mu / field[wall_cell].rho;
+            double S = 0.0, Omega = 0.0; // negligible at this check's coarse resolution; F2/nu_t dominated by k/omega here
+            double F2c = sst_F2(k_field[wall_cell], omega_field[wall_cell], nu_lam_wall,
+                                 mesh.cells[wall_cell].y_centroid);
+            double nu_t_c = sst_eddy_viscosity(k_field[wall_cell], omega_field[wall_cell], S, Omega, F2c,
+                                                 SSTLimiterVariant::Vorticity);
+            double ratio = nu_t_c / nu;
+            std::cout << "  step " << (last_step + 1) << ": exit-station wall-cell nu_t/nu = " << ratio << "\n";
+            if (last_nu_t_ratio >= 0.0) nu_t_growing = ratio > last_nu_t_ratio * 1.01; // >1% growth since the last check
+            last_nu_t_ratio = ratio;
+        }
+    }
+    std::cout << "Simulation completed across " << last_step << " steps.\n";
+    std::cout << "  nu_t/nu trend over the run's final check interval: "
+               << (nu_t_growing ? "growing (sustaining turbulence)" : "decaying or flat (laminar-decay signature)")
+               << "\n";
+
+    const std::vector<EulerState>& field = solver.field();
+    const std::vector<double>& k_field = solver.k_field();
+    const std::vector<double>& omega_field = solver.omega_field();
+
+    double y_wall_cell = mesh.cells[wall_cell].y_centroid;
+    double u_wall_cell = field[wall_cell].rho_u / field[wall_cell].rho;
+    double rho_wall_cell = field[wall_cell].rho;
+    double nu_lam_wall = mu / rho_wall_cell;
+    double F2_wall = sst_F2(k_field[wall_cell], omega_field[wall_cell], nu_lam_wall, y_wall_cell);
+    double nu_t_wall_cell =
+        sst_eddy_viscosity(k_field[wall_cell], omega_field[wall_cell], 0.0, 0.0, F2_wall, SSTLimiterVariant::Vorticity);
+    double mu_eff_wall = mu + rho_wall_cell * nu_t_wall_cell;
+    double tau_wall = mu_eff_wall * u_wall_cell / y_wall_cell;
+    double u_tau = std::sqrt(std::fabs(tau_wall) / rho_wall_cell);
+
+    std::cout << "  exit-station wall cell: u = " << u_wall_cell << ", y = " << y_wall_cell
+               << ", nu_t = " << nu_t_wall_cell << " (nu = " << nu << ", ratio = " << (nu_t_wall_cell / nu)
+               << "), tau_wall = " << tau_wall << ", u_tau = " << u_tau << "\n";
+
+    std::vector<double> y_profile(n_y), u_profile(n_y);
+    for (int j = 0; j < n_y; ++j) {
+        int c = j * n_x + (n_x - 1);
+        y_profile[j] = mesh.cells[c].y_centroid;
+        u_profile[j] = field[c].rho_u / field[c].rho;
+    }
+
+    if (!nu_t_growing) {
+        // Laminar Pohlhausen comparison -- identical methodology to
+        // run_verify_flat_plate_boundary_layer(); see that function's own
+        // class comment for the full rationale (delta_99 from this run's own
+        // profile, not an independent analytic estimate).
+        double delta99 = y_profile.back();
+        for (int j = 0; j + 1 < n_y; ++j) {
+            if (u_profile[j] < 0.99 * u_inf && u_profile[j + 1] >= 0.99 * u_inf) {
+                double t = (0.99 * u_inf - u_profile[j]) / (u_profile[j + 1] - u_profile[j]);
+                delta99 = y_profile[j] + t * (y_profile[j + 1] - y_profile[j]);
+                break;
+            }
+        }
+
+        int n_in_bl = 0;
+        double sum_sq_error = 0.0, max_error = 0.0;
+        for (int j = 0; j < n_y; ++j) {
+            double eta = y_profile[j] / delta99;
+            if (eta > 1.0) break;
+            double u_over_U = u_profile[j] / u_inf;
+            double pohlhausen = 2.0 * eta - 2.0 * eta * eta * eta + eta * eta * eta * eta;
+            double err = u_over_U - pohlhausen;
+            sum_sq_error += err * err;
+            max_error = std::max(max_error, std::abs(err));
+            ++n_in_bl;
+        }
+
+        if (n_in_bl < 3) {
+            std::cout << "FAIL: fewer than 3 cells landed inside the boundary layer (y < delta_99); "
+                         "cannot meaningfully compare against the Pohlhausen profile.\n";
+            return false;
+        }
+
+        double l2_error = std::sqrt(sum_sq_error / n_in_bl);
+        std::cout << "  delta_99 (interpolated) = " << delta99 << ", " << n_in_bl
+                   << " cells inside the boundary layer: max |u/U - Pohlhausen| = " << max_error
+                   << ", L2 = " << l2_error << "\n";
+
+        bool passed = l2_error < 0.15;
+        std::cout << (passed ? "PASS" : "FAIL")
+                   << ": nu_t/nu did not sustain growth at this sub-transition Re_L, so the mean-flow profile "
+                      "must match the laminar Pohlhausen approximation (not a turbulent log-law).\n";
+
+        // General compute_boundary_layer_profiles()/compute_wall_traction()
+        // regression + Blasius Cf + Pohlhausen thickness-ratio checks, same
+        // methodology as run_verify_flat_plate_boundary_layer() but via the
+        // solver's own public compute_wall_traction_samples()/
+        // compute_boundary_layer_profile_samples() rather than hand-rebuilt
+        // gradients (both are public here, unlike RANSTurbulenceSASolver's
+        // now-private equivalents at the time that function was written).
+        int exit_wall_face = -1;
+        for (size_t i = 0; i < mesh.faces.size(); ++i) {
+            const Face& f = mesh.faces[i];
+            if (f.cell_right == -1 && f.cell_left == wall_cell && f.patch_id == 0) {
+                exit_wall_face = (int)i;
+                break;
+            }
+        }
+        std::vector<WallFaceSample> exit_traction = solver.compute_wall_traction_samples({exit_wall_face});
+        std::vector<BoundaryLayerProfile> exit_profile =
+            solver.compute_boundary_layer_profile_samples({exit_wall_face}, u_inf, n_y);
+
+        double delta99_general = exit_profile[0].delta_99;
+        double delta99_regression_error = std::abs(delta99_general - delta99) / delta99;
+
+        WallReferenceQuantities blasius_ref;
+        blasius_ref.rho_ref = rho_inf;
+        blasius_ref.velocity_x_ref = u_inf;
+        blasius_ref.velocity_y_ref = 0.0;
+        double cf_computed = skin_friction_coefficient(exit_traction[0], blasius_ref);
+        double cf_blasius = 0.664 / std::sqrt(Re_L);
+        double cf_rel_error = std::abs(std::fabs(cf_computed) - cf_blasius) / cf_blasius;
+
+        double disp_ratio = exit_profile[0].displacement_thickness / delta99_general;
+        double mom_ratio = exit_profile[0].momentum_thickness / delta99_general;
+        const double disp_ratio_exact = 0.3;
+        const double mom_ratio_exact = 37.0 / 315.0;
+        double disp_ratio_error = std::abs(disp_ratio - disp_ratio_exact);
+        double mom_ratio_error = std::abs(mom_ratio - mom_ratio_exact);
+
+        std::cout << "  General compute_boundary_layer_profiles() at the exit station:\n"
+                   << "    delta_99 = " << delta99_general << " (hardcoded computation above: " << delta99
+                   << ", relative diff = " << delta99_regression_error << ")\n"
+                   << "    Cf = " << cf_computed << " (Blasius Cf = 0.664/sqrt(Re_L) = " << cf_blasius
+                   << ", relative error = " << cf_rel_error << ")\n"
+                   << "    displacement_thickness/delta_99 = " << disp_ratio << " (Pohlhausen exact = "
+                   << disp_ratio_exact << ", |diff| = " << disp_ratio_error << ")\n"
+                   << "    momentum_thickness/delta_99 = " << mom_ratio << " (Pohlhausen exact = " << mom_ratio_exact
+                   << ", |diff| = " << mom_ratio_error << ")\n"
+                   << "    n_cells_marched = " << exit_profile[0].n_cells_marched << " (of " << n_y << " available)\n";
+
+        bool general_bl_passed = delta99_regression_error < 0.01 && cf_rel_error < 0.4 && disp_ratio_error < 0.05 &&
+                                  mom_ratio_error < 0.05;
+        std::cout << (general_bl_passed ? "PASS" : "FAIL")
+                   << ": the general compute_boundary_layer_profiles() must reproduce the hardcoded delta_99 above "
+                      "and match the Blasius/Pohlhausen closed-form Cf/thickness-ratio values.\n";
+
+        return passed && general_bl_passed;
+    }
+
+    // Turbulent log-law comparison -- only reached if nu_t/nu was actually
+    // observed growing above.
+    const double kappa = 0.41, B = 5.0;
+    int n_in_log_region = 0;
+    double sum_sq_error = 0.0, max_error = 0.0;
+    for (int j = 0; j < n_y; ++j) {
+        double y_plus = y_profile[j] * u_tau / nu_lam_wall;
+        if (y_plus < 30.0 || y_plus > 1000.0) continue; // classical log-law validity window
+        double u_plus = u_profile[j] / u_tau;
+        double log_law = std::log(y_plus) / kappa + B;
+        double err = u_plus - log_law;
+        sum_sq_error += err * err;
+        max_error = std::max(max_error, std::abs(err));
+        ++n_in_log_region;
+    }
+
+    if (n_in_log_region < 3) {
+        std::cout << "FAIL: fewer than 3 cells landed inside the log-law's y+ validity window (30-1000); "
+                     "cannot meaningfully compare against u+ = ln(y+)/kappa + B.\n";
+        return false;
+    }
+
+    double l2_error = std::sqrt(sum_sq_error / n_in_log_region);
+    std::cout << "  " << n_in_log_region << " cells inside the log-law y+ window: max |u+ - log_law| = " << max_error
+               << ", L2 = " << l2_error << "\n";
+    bool passed = l2_error < 0.15;
+    std::cout << (passed ? "PASS" : "FAIL")
+               << ": nu_t/nu sustained growth, so the mean-flow profile must match the turbulent log-law.\n";
+    return passed;
 }
 
 // Runs docs/wall-diagnostics-plan.md's Validation step 4: a stress test of
@@ -1286,7 +1687,7 @@ bool run_verify_couette() {
     for (; last_step < nsteps; ++last_step) {
         solver.step();
         const EulerResidualNorms& r = solver.residual();
-        if (std::isnan(r.rho_u) || std::isinf(r.rho_u)) {
+        if (is_nan_or_inf(r.rho_u)) {
             std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
             return false;
         }
@@ -1318,6 +1719,456 @@ bool run_verify_couette() {
     std::cout << (passed ? "PASS" : "FAIL")
                << ": velocity profile must match the analytic linear Couette profile u(y) = U*y/H within 5% (L2).\n";
     return passed;
+}
+
+// Verifies CflRamp.h's next_cfl(), per docs/adaptive-cfl-ramp-plan.md's
+// Validation plan items 1-2: first as a standalone pure function against
+// synthetic residual sequences (no mesh/solver needed), then end-to-end on
+// run_verify_couette()'s own Couette-flow setup, comparing a fixed-cfl run
+// against a ramp run targeting the same cfl as its ceiling. Items 3-5 (a real
+// divergent case, the SST flat-plate rerun, and the case-file backward-
+// compatibility smoke test) are left as follow-up work -- see this function's
+// own comment in docs/adaptive-cfl-ramp-plan.md's Status section.
+//
+// Input:   none
+// Returns: true if every check below passes; false otherwise
+bool run_verify_cfl_ramp() {
+    bool all_passed = true;
+
+    // --- 1. next_cfl() unit-style checks (no mesh/solver) ---
+    {
+        CflRampParams params; // defaults: cfl_min=0.05, growth=1.5, shrink=0.5, window=15, divergence_threshold=2.0
+        const double cfl_max = 1.0;
+
+        // Monotonically decreasing residual: should grow once the window
+        // fills, clamped at cfl_max.
+        {
+            double cfl = params.cfl_min;
+            std::vector<double> history;
+            double residual = 1.0;
+            bool grew = false, clamped_at_max = false;
+            for (int step = 0; step < 200; ++step) {
+                residual *= 0.9;
+                history.push_back(residual);
+                if (static_cast<int>(history.size()) > params.window) history.erase(history.begin());
+                double next = next_cfl(cfl, cfl_max, history, params);
+                if (next > cfl + 1e-12) grew = true;
+                if (next > cfl_max + 1e-12) {
+                    std::cout << "FAIL: next_cfl() exceeded cfl_max on a decreasing residual sequence\n";
+                    all_passed = false;
+                }
+                cfl = next;
+            }
+            clamped_at_max = cfl >= cfl_max - 1e-9;
+            if (!grew || !clamped_at_max) {
+                std::cout << "FAIL: next_cfl() did not grow to cfl_max on a monotonically decreasing residual sequence\n";
+                all_passed = false;
+            }
+        }
+
+        // Mildly, monotonically increasing residual (never past the
+        // divergence threshold within one window): should shrink, floored at cfl_min.
+        {
+            double cfl = cfl_max;
+            std::vector<double> history;
+            double residual = 1.0;
+            bool shrank = false;
+            for (int step = 0; step < 200; ++step) {
+                residual *= 1.02; // 15-step window * log10(1.02) ~= 0.13: above the ~0.041 hold deadband, well under divergence_threshold=2.0
+                history.push_back(residual);
+                if (static_cast<int>(history.size()) > params.window) history.erase(history.begin());
+                double next = next_cfl(cfl, cfl_max, history, params);
+                if (next < cfl - 1e-12) shrank = true;
+                if (next < params.cfl_min - 1e-9) {
+                    std::cout << "FAIL: next_cfl() dropped below cfl_min on a mildly rising residual sequence\n";
+                    all_passed = false;
+                }
+                cfl = next;
+            }
+            if (!shrank || cfl > params.cfl_min + 1e-6) {
+                std::cout << "FAIL: next_cfl() did not shrink to cfl_min on a monotonically rising residual sequence\n";
+                all_passed = false;
+            }
+        }
+
+        // Flat residual history (within the hold deadband): should hold current_cfl unchanged.
+        {
+            double cfl = 0.3;
+            std::vector<double> history(static_cast<size_t>(params.window), 1.0);
+            double next = next_cfl(cfl, cfl_max, history, params);
+            if (std::abs(next - cfl) > 1e-12) {
+                std::cout << "FAIL: next_cfl() changed cfl on a perfectly flat residual history (expected hold)\n";
+                all_passed = false;
+            }
+        }
+
+        // Divergent jump across the window (> divergence_threshold orders of
+        // magnitude): should hard-reset to cfl_min even from a high current_cfl.
+        {
+            double cfl = cfl_max;
+            std::vector<double> history(static_cast<size_t>(params.window), 1.0);
+            history.back() = std::pow(10.0, params.divergence_threshold + 1.0);
+            double next = next_cfl(cfl, cfl_max, history, params);
+            if (std::abs(next - params.cfl_min) > 1e-9) {
+                std::cout << "FAIL: next_cfl() did not hard-reset to cfl_min on a divergent residual jump\n";
+                all_passed = false;
+            }
+        }
+
+        // Not enough history yet: fewer than 'window' entries should hold current_cfl unchanged.
+        {
+            double cfl = 0.2;
+            std::vector<double> history{1.0, 0.5};
+            double next = next_cfl(cfl, cfl_max, history, params);
+            if (std::abs(next - cfl) > 1e-12) {
+                std::cout << "FAIL: next_cfl() reacted before its residual history window was full\n";
+                all_passed = false;
+            }
+        }
+
+        std::cout << (all_passed ? "PASS" : "FAIL")
+                   << ": next_cfl() unit-style checks (grow/shrink/hold/divergence-reset/warm-up)\n";
+    }
+
+    // --- 2. End-to-end: fixed vs ramp on run_verify_couette()'s own Couette-flow setup ---
+    {
+        const int n_x = 1, n_y = 16;
+        const double shear = 0.3;
+        const double gamma = 1.4, gas_constant = 1.0, mu = 0.02, prandtl = 0.72;
+        const double rho0 = 1.0, p0 = 1.0, U = 0.1;
+        const double H = 1.0;
+        const int nsteps = 20000;
+        const double cfl_target = 0.3; // same fixed cfl run_verify_couette() itself uses
+
+        auto build_couette = [&](UnstructuredMesh& mesh, std::vector<NSBoundaryCondition>& bcs,
+                                   EulerInitialCondition& ic) {
+            build_sheared_verification_mesh(mesh, n_x, n_y, shear);
+            mesh.compute_geometry();
+            bcs.assign(mesh.patches.size(), NSBoundaryCondition{});
+            bcs[0].type = NSBoundaryType::NoSlipWall;
+            bcs[1].type = NSBoundaryType::Outflow;
+            bcs[2].type = NSBoundaryType::NoSlipWall;
+            bcs[2].wall_u = U;
+            bcs[3].type = NSBoundaryType::Outflow;
+            ic.mode = EulerICMode::Freestream;
+            ic.rho = rho0; ic.u = 0.0; ic.v = 0.0; ic.p = p0;
+        };
+        auto l2_relative_error = [&](const UnstructuredMesh& mesh, const std::vector<EulerState>& field) {
+            double sum_sq_error = 0.0;
+            for (size_t i = 0; i < mesh.cells.size(); ++i) {
+                double u = field[i].rho_u / field[i].rho;
+                double exact_u = U * mesh.cells[i].y_centroid / H;
+                double err = u - exact_u;
+                sum_sq_error += err * err;
+            }
+            return std::sqrt(sum_sq_error / mesh.cells.size()) / U;
+        };
+
+        UnstructuredMesh mesh_fixed;
+        std::vector<NSBoundaryCondition> bcs_fixed;
+        EulerInitialCondition ic_fixed;
+        build_couette(mesh_fixed, bcs_fixed, ic_fixed);
+        NavierStokesFVMSolver solver_fixed(mesh_fixed, bcs_fixed, gamma, gas_constant, mu, prandtl, cfl_target,
+                                            ic_fixed, NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares,
+                                            1e-6, 20);
+        bool diverged_fixed = false;
+        for (int step = 0; step < nsteps && !diverged_fixed; ++step) {
+            solver_fixed.step();
+            const EulerResidualNorms& r = solver_fixed.residual();
+            diverged_fixed = is_nan_or_inf(r.rho_u);
+        }
+        double error_fixed = l2_relative_error(mesh_fixed, solver_fixed.field());
+
+        UnstructuredMesh mesh_ramp;
+        std::vector<NSBoundaryCondition> bcs_ramp;
+        EulerInitialCondition ic_ramp;
+        build_couette(mesh_ramp, bcs_ramp, ic_ramp);
+        CflRampParams ramp_params; // defaults
+        NavierStokesFVMSolver solver_ramp(mesh_ramp, bcs_ramp, gamma, gas_constant, mu, prandtl, cfl_target, ic_ramp,
+                                           NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares, 1e-6, 20);
+        double current_cfl = ramp_params.cfl_min;
+        solver_ramp.set_cfl(current_cfl);
+        std::vector<double> residual_history;
+        double min_cfl_seen = current_cfl, max_cfl_seen = current_cfl;
+        bool diverged_ramp = false;
+        for (int step = 0; step < nsteps && !diverged_ramp; ++step) {
+            solver_ramp.step();
+            const EulerResidualNorms& r = solver_ramp.residual();
+            diverged_ramp = is_nan_or_inf(r.rho);
+            if (diverged_ramp) break;
+            residual_history.push_back(r.rho);
+            if (static_cast<int>(residual_history.size()) > ramp_params.window) residual_history.erase(residual_history.begin());
+            current_cfl = next_cfl(current_cfl, cfl_target, residual_history, ramp_params);
+            solver_ramp.set_cfl(current_cfl);
+            min_cfl_seen = std::min(min_cfl_seen, current_cfl);
+            max_cfl_seen = std::max(max_cfl_seen, current_cfl);
+        }
+        double error_ramp = l2_relative_error(mesh_ramp, solver_ramp.field());
+
+        std::cout << "CFL ramp end-to-end (Couette flow): fixed cfl=" << cfl_target << " L2 rel. error=" << error_fixed
+                   << (diverged_fixed ? " (DIVERGED)" : "") << "; ramp (cfl_min=" << ramp_params.cfl_min
+                   << " -> ceiling=" << cfl_target << ") L2 rel. error=" << error_ramp
+                   << (diverged_ramp ? " (DIVERGED)" : "") << ", cfl range seen=[" << min_cfl_seen << ", "
+                   << max_cfl_seen << "]\n";
+
+        bool both_converged = !diverged_fixed && !diverged_ramp && error_fixed < 0.05 && error_ramp < 0.05;
+        bool started_at_min = std::abs(min_cfl_seen - ramp_params.cfl_min) < 1e-9;
+        bool reached_ceiling = max_cfl_seen > 0.9 * cfl_target;
+        bool ok = both_converged && started_at_min && reached_ceiling;
+        all_passed = all_passed && ok;
+        std::cout << (ok ? "PASS" : "FAIL")
+                   << ": ramp mode converges to the same Couette steady solution as fixed mode (both within 5% L2), "
+                      "starting at cfl_min and reaching near the cfl ceiling.\n";
+    }
+
+    // --- 3. Stress test: bisect for a cfl that diverges in fixed mode on
+    // --verify-ns-stretched-cfl's own stretched mesh, then confirm ramp mode
+    // survives (or at minimum fails no sooner than a fixed run pinned at
+    // cfl_min) targeting that value as the ceiling. See
+    // docs/adaptive-cfl-ramp-plan.md's Validation plan item 3.
+    {
+        const double L = 1.0, H = 0.05;
+        const int n_x = 10;
+        const double first_cell_height = 1.0e-4;
+        const double growth_ratio = 1.05;
+        const double gamma = 1.4, gas_constant = 1.0, prandtl = 0.72;
+        const double rho_inf = 1.0, p_inf = 1.0, u_inf = 0.5, mu = 0.02;
+        const int max_steps = 500;
+        CflRampParams ramp_params;
+
+        UnstructuredMesh probe_mesh;
+        int n_y = build_flat_plate_mesh(probe_mesh, n_x, L, H, first_cell_height, growth_ratio);
+
+        // Returns the 1-based step at which the run diverged (NaN/Inf
+        // residual), or -1 if it survived max_steps.
+        auto build_and_run_fixed = [&](double cfl_trial) {
+            UnstructuredMesh mesh;
+            build_flat_plate_mesh(mesh, n_x, L, H, first_cell_height, growth_ratio);
+            mesh.compute_geometry();
+            EulerState freestream = from_primitive(rho_inf, u_inf, 0.0, p_inf, gamma);
+            std::vector<NSBoundaryCondition> bcs(mesh.patches.size());
+            bcs[0].type = NSBoundaryType::NoSlipWall;
+            bcs[1].type = NSBoundaryType::Farfield; bcs[1].farfield_state = freestream;
+            bcs[2].type = NSBoundaryType::Farfield; bcs[2].farfield_state = freestream;
+            bcs[3].type = NSBoundaryType::Outflow;
+            EulerInitialCondition ic;
+            ic.mode = EulerICMode::Freestream;
+            ic.rho = rho_inf; ic.u = u_inf; ic.v = 0.0; ic.p = p_inf;
+            NavierStokesFVMSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, cfl_trial, ic,
+                                          NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares, 1e-6, 20);
+            for (int step = 0; step < max_steps; ++step) {
+                solver.step();
+                const EulerResidualNorms& r = solver.residual();
+                if (is_nan_or_inf(r.rho) || is_nan_or_inf(r.rho_u) ||
+                    is_nan_or_inf(r.rho_v) || is_nan_or_inf(r.E)) {
+                    return step + 1;
+                }
+            }
+            return -1;
+        };
+
+        // Doubling search for a divergent cfl, starting from the
+        // already-known-stable 2.0 (--verify-ns-stretched-cfl).
+        double lo = 2.0, hi = 2.0;
+        const double search_cap = 512.0;
+        bool found_divergent = false;
+        while (hi < search_cap) {
+            hi *= 2.0;
+            if (build_and_run_fixed(hi) > 0) { found_divergent = true; break; }
+            lo = hi;
+        }
+
+        if (!found_divergent) {
+            std::cout << "INFO: no cfl up to " << search_cap << " diverged fixed-mode on the " << n_x << "x" << n_y
+                       << " stretched mesh within " << max_steps
+                       << " steps -- stress test skipped (no divergent value to compare against).\n";
+        } else {
+            // Binary search to narrow the boundary a bit (not required to be
+            // exact -- just avoids reporting an unnecessarily extreme value).
+            for (int i = 0; i < 12; ++i) {
+                double mid = 0.5 * (lo + hi);
+                if (build_and_run_fixed(mid) > 0) hi = mid; else lo = mid;
+            }
+            double cfl_divergent = hi;
+
+            int fail_step_divergent = build_and_run_fixed(cfl_divergent);
+            int fail_step_cfl_min = build_and_run_fixed(ramp_params.cfl_min);
+
+            UnstructuredMesh mesh_ramp;
+            build_flat_plate_mesh(mesh_ramp, n_x, L, H, first_cell_height, growth_ratio);
+            mesh_ramp.compute_geometry();
+            EulerState freestream = from_primitive(rho_inf, u_inf, 0.0, p_inf, gamma);
+            std::vector<NSBoundaryCondition> bcs(mesh_ramp.patches.size());
+            bcs[0].type = NSBoundaryType::NoSlipWall;
+            bcs[1].type = NSBoundaryType::Farfield; bcs[1].farfield_state = freestream;
+            bcs[2].type = NSBoundaryType::Farfield; bcs[2].farfield_state = freestream;
+            bcs[3].type = NSBoundaryType::Outflow;
+            EulerInitialCondition ic;
+            ic.mode = EulerICMode::Freestream;
+            ic.rho = rho_inf; ic.u = u_inf; ic.v = 0.0; ic.p = p_inf;
+            NavierStokesFVMSolver solver_ramp(mesh_ramp, bcs, gamma, gas_constant, mu, prandtl, cfl_divergent, ic,
+                                               NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares, 1e-6, 20);
+            double current_cfl = ramp_params.cfl_min;
+            solver_ramp.set_cfl(current_cfl);
+            std::vector<double> residual_history;
+            int fail_step_ramp = -1;
+            for (int step = 0; step < max_steps; ++step) {
+                solver_ramp.step();
+                const EulerResidualNorms& r = solver_ramp.residual();
+                if (is_nan_or_inf(r.rho) || is_nan_or_inf(r.rho_u) ||
+                    is_nan_or_inf(r.rho_v) || is_nan_or_inf(r.E)) {
+                    fail_step_ramp = step + 1;
+                    break;
+                }
+                residual_history.push_back(r.rho);
+                if (static_cast<int>(residual_history.size()) > ramp_params.window) {
+                    residual_history.erase(residual_history.begin());
+                }
+                current_cfl = next_cfl(current_cfl, cfl_divergent, residual_history, ramp_params);
+                solver_ramp.set_cfl(current_cfl);
+            }
+
+            std::cout << "CFL ramp stress test: bisected divergent cfl = " << cfl_divergent << " on the " << n_x
+                       << "x" << n_y << " stretched mesh (mu=" << mu << ")\n"
+                       << "  fixed at cfl=" << cfl_divergent << ": "
+                       << (fail_step_divergent > 0 ? ("diverged at step " + std::to_string(fail_step_divergent))
+                                                    : "survived")
+                       << "\n"
+                       << "  fixed at cfl_min=" << ramp_params.cfl_min << " (baseline): "
+                       << (fail_step_cfl_min > 0 ? ("diverged at step " + std::to_string(fail_step_cfl_min))
+                                                  : "survived")
+                       << "\n"
+                       << "  ramp targeting cfl=" << cfl_divergent << " as ceiling: "
+                       << (fail_step_ramp > 0 ? ("diverged at step " + std::to_string(fail_step_ramp)) : "survived")
+                       << "\n";
+
+            bool sanity_ok = fail_step_divergent > 0;   // the bisected value really does diverge fixed
+            bool baseline_ok = fail_step_cfl_min < 0;   // pinned at cfl_min really is stable
+            bool ramp_ok = (fail_step_ramp < 0) ||      // ramp survives outright, or...
+                           (fail_step_cfl_min > 0 && fail_step_ramp >= fail_step_cfl_min); // ...fails no sooner than the cfl_min baseline
+            bool ok = sanity_ok && baseline_ok && ramp_ok;
+            all_passed = all_passed && ok;
+            std::cout << (ok ? "PASS" : "FAIL")
+                       << ": ramp mode must survive a fixed-mode-divergent cfl, or at minimum fail no sooner than "
+                          "a fixed run pinned at cfl_min for its entire duration.\n";
+        }
+    }
+
+    // --- 4. SST-specific: rerun run_verify_sst_flat_plate()'s exact setup
+    // once fixed and once ramp (same cfl ceiling), and confirm the nu_t/nu
+    // trend verdict (decaying/flat "laminar-decay signature" vs. growing)
+    // is identical -- demonstrating this feature doesn't change SST's
+    // separately-documented turbulence-sustaining finding. See
+    // docs/adaptive-cfl-ramp-plan.md's Validation plan item 4.
+    {
+        const double L = 1.0, H = 0.2;
+        const int n_x = 40;
+        const double first_cell_height = 2.949e-3;
+        const double growth_ratio = 1.15;
+
+        const double gamma = 1.4, gas_constant = 1.0, prandtl = 0.72, prandtl_t = 0.9, cfl_ceiling = 0.3;
+        const double rho_inf = 1.0, p_inf = 1.0, u_inf = 0.2;
+        const double Re_L = 1.0e4;
+        const double mu = rho_inf * u_inf * L / Re_L;
+        const double nu = mu / rho_inf;
+
+        const double freestream_Tu = 0.05, freestream_ratio = 3.0;
+        const double initial_k = 1.5 * (freestream_Tu * u_inf) * (freestream_Tu * u_inf);
+        const double initial_omega = initial_k / (freestream_ratio * nu);
+
+        const int nsteps = 20000;
+        const int nu_t_check_interval = 2000;
+        CflRampParams ramp_params;
+
+        // Returns the final-interval nu_t_growing verdict, same determination
+        // run_verify_sst_flat_plate() itself uses (>1% growth since the
+        // previous nu_t_check_interval-step check).
+        auto run_sst_flat_plate = [&](bool use_ramp) {
+            UnstructuredMesh mesh;
+            int n_y_local = build_flat_plate_mesh(mesh, n_x, L, H, first_cell_height, growth_ratio);
+            mesh.compute_geometry();
+
+            EulerState freestream = from_primitive(rho_inf, u_inf, 0.0, p_inf, gamma);
+            std::vector<RANSBoundaryConditionSST> bcs(mesh.patches.size());
+            bcs[0].ns.type = NSBoundaryType::NoSlipWall;
+            bcs[1].ns.type = NSBoundaryType::Farfield;
+            bcs[1].ns.farfield_state = freestream;
+            bcs[1].farfield_k = initial_k;
+            bcs[1].farfield_omega = initial_omega;
+            bcs[2].ns.type = NSBoundaryType::Farfield;
+            bcs[2].ns.farfield_state = freestream;
+            bcs[2].farfield_k = initial_k;
+            bcs[2].farfield_omega = initial_omega;
+            bcs[3].ns.type = NSBoundaryType::Outflow;
+
+            EulerInitialCondition ic;
+            ic.mode = EulerICMode::Freestream;
+            ic.rho = rho_inf; ic.u = u_inf; ic.v = 0.0; ic.p = p_inf;
+
+            double initial_cfl = use_ramp ? ramp_params.cfl_min : cfl_ceiling;
+            RANSTurbulenceSSTSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, initial_cfl, ic,
+                                             initial_k, initial_omega, NumericalFluxScheme::Rusanov,
+                                             GradientScheme::LeastSquares, 1e-6, 20, SSTLimiterVariant::Vorticity);
+
+            int wall_cell = (n_x - 1);
+            double last_nu_t_ratio = -1.0;
+            bool nu_t_growing = false;
+            double current_cfl = initial_cfl;
+            std::vector<double> residual_history;
+
+            for (int step = 0; step < nsteps; ++step) {
+                solver.step();
+                const EulerResidualNorms& r = solver.residual();
+                double kr = solver.k_residual();
+                double wr = solver.omega_residual();
+                if (is_nan_or_inf(r.rho_u) || is_nan_or_inf(kr) ||
+                    is_nan_or_inf(wr)) {
+                    std::cout << "  (" << (use_ramp ? "ramp" : "fixed") << " pass) diverged at step " << step + 1
+                               << "\n";
+                    return true; // treat an unexpected divergence as a "growing" (i.e. non-matching) verdict
+                }
+
+                if (use_ramp) {
+                    residual_history.push_back(r.rho);
+                    if (static_cast<int>(residual_history.size()) > ramp_params.window) {
+                        residual_history.erase(residual_history.begin());
+                    }
+                    current_cfl = next_cfl(current_cfl, cfl_ceiling, residual_history, ramp_params);
+                    solver.set_cfl(current_cfl);
+                }
+
+                if ((step + 1) % nu_t_check_interval == 0) {
+                    const std::vector<double>& k_field = solver.k_field();
+                    const std::vector<double>& omega_field = solver.omega_field();
+                    const std::vector<EulerState>& field = solver.field();
+                    double nu_lam_wall = mu / field[wall_cell].rho;
+                    double F2c = sst_F2(k_field[wall_cell], omega_field[wall_cell], nu_lam_wall,
+                                         mesh.cells[wall_cell].y_centroid);
+                    double nu_t_c = sst_eddy_viscosity(k_field[wall_cell], omega_field[wall_cell], 0.0, 0.0, F2c,
+                                                         SSTLimiterVariant::Vorticity);
+                    double ratio = nu_t_c / nu;
+                    if (last_nu_t_ratio >= 0.0) nu_t_growing = ratio > last_nu_t_ratio * 1.01;
+                    last_nu_t_ratio = ratio;
+                }
+            }
+            std::cout << "  (" << (use_ramp ? "ramp" : "fixed") << " pass, " << n_x << "x" << n_y_local
+                       << " mesh) final nu_t/nu = " << last_nu_t_ratio << ", trend = "
+                       << (nu_t_growing ? "growing" : "decaying or flat") << "\n";
+            return nu_t_growing;
+        };
+
+        std::cout << "SST flat-plate ramp rerun (cfl ceiling = " << cfl_ceiling << "):\n";
+        bool fixed_growing = run_sst_flat_plate(false);
+        bool ramp_growing = run_sst_flat_plate(true);
+
+        bool ok = (fixed_growing == ramp_growing);
+        all_passed = all_passed && ok;
+        std::cout << (ok ? "PASS" : "FAIL")
+                   << ": ramp mode's nu_t/nu trend verdict must match fixed mode's (both decaying/flat, or both "
+                      "growing) -- this feature must not change SST's turbulence-sustaining finding.\n";
+    }
+
+    return all_passed;
 }
 
 // Runs Phase 1's own verification gate for WallTraction.h's force/Cf/Cp/y+/Cm
@@ -1508,7 +2359,7 @@ bool run_verify_ns_stretched_cfl() {
     for (; last_step < nsteps; ++last_step) {
         solver.step();
         const EulerResidualNorms& r = solver.residual();
-        if (std::isnan(r.rho_u) || std::isinf(r.rho_u)) {
+        if (is_nan_or_inf(r.rho_u)) {
             std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
             std::cout << "FAIL: run must complete without diverging at this cfl on an anisotropic mesh.\n";
             return false;
@@ -1524,7 +2375,7 @@ bool run_verify_ns_stretched_cfl() {
 // case, per docs/archive/rans-spalart-allmaras-tracker.md Phase 1's "planned
 // verification". Reuses run_verify_couette()'s sheared mesh purely for its
 // geometry -- no solver is involved here, since the wall-distance module has
-// no dependency on NavierStokesFVMSolver/RANSFVMSolver, only on mesh
+// no dependency on NavierStokesFVMSolver/RANSTurbulenceSASolver, only on mesh
 // geometry and a list of wall face indices.
 //
 // The bottom wall ("bottom" patch) is a straight horizontal line at y=0 for
@@ -1672,8 +2523,224 @@ bool run_verify_sa_source_terms() {
     return test1_passed && test2_passed;
 }
 
+// Runs Phase 1 of the SST tracker's own verification gate (docs/sst-komega-tracker.md),
+// checking compute_sst_source_terms() (SSTKOmega.h) in isolation -- independent
+// of any transport equation or coupled solver (that's Phase 2/3's job), same
+// scoping as run_verify_sa_source_terms() above.
+//
+// Test 1: the zero state (k=0, omega=0, zero mean-flow velocity gradients)
+// is a genuine fixed point -- every source term comes out to exactly 0, and
+// an explicit-Euler time loop of k/omega using those source terms leaves
+// both at exactly 0 after any number of steps. Mirrors run_verify_sa_source_terms()'s
+// Test 1.
+//
+// Test 2: on the same 1x16 sheared mesh as run_verify_wall_distance() (wall
+// distance == y_centroid exactly), a manufactured LINEAR mean-flow velocity
+// field (u = a*x + b*y, v = c*x + d*y) whose gradient GradientCalculator's
+// Least-Squares scheme reconstructs EXACTLY (per GradientReconstruction.h's
+// own documented exactness for a linear field), giving hand-computable exact
+// S/Omega values everywhere to check against -- not a re-derivation of the
+// implementation's own formula, a fully independent check. k/omega fields
+// are likewise linear in y (k = k0*(1+y), omega = omega0*(1+y)), so their
+// gradients are also reconstructed exactly. Checks, per cell:
+//   - S and Omega match their hand-derived exact values (tight tolerance)
+//   - production/destruction/cross_diffusion are finite and non-negative
+//   - production/destruction/cross_diffusion match the documented formula
+//     evaluated from the RETURNED F1/F2/nu_t intermediates -- an independent
+//     arithmetic check on the aggregation step even though F1/F2 themselves
+//     aren't independently hand-derived at every point
+// and, at the near-wall and far-from-wall cells specifically (smallest/largest
+// wall distance), that F1 and F2 approach their known asymptotic limits (1
+// near the wall, 0 far from it -- see compute_sst_source_terms()'s
+// commentary), independent of the model's specific constant values. Run
+// twice, once per SSTLimiterVariant, confirming the two variants' nu_t and
+// k_production clip actually differ (i.e. the variant switch has real effect,
+// not silently ignored).
+//
+// Input:  none
+// Output: prints all sub-test results
+// Returns: true if every sub-test passes; false otherwise
+bool run_verify_sst_source_terms() {
+    const int n_x = 1, n_y = 16;
+    const double shear = 0.3;
+    const double rho0 = 1.0, mu = 0.02;
+    const double nu = mu / rho0;
+
+    UnstructuredMesh mesh;
+    build_sheared_verification_mesh(mesh, n_x, n_y, shear);
+    mesh.compute_geometry();
+
+    const int PATCH_BOTTOM = 0;
+    std::vector<int> wall_faces;
+    for (size_t i = 0; i < mesh.faces.size(); ++i) {
+        if (mesh.faces[i].patch_id == PATCH_BOTTOM) wall_faces.push_back((int)i);
+    }
+    std::vector<double> wall_distance = compute_wall_distance(mesh, wall_faces);
+
+    // Test 1: zero state stays exactly zero under time marching.
+    std::vector<double> k(mesh.cells.size(), 0.0), omega(mesh.cells.size(), 0.0);
+    const int nsteps = 1000;
+    const double dt = 0.01;
+    bool test1_zero_source = true;
+    for (int step = 0; step < nsteps; ++step) {
+        for (size_t c = 0; c < mesh.cells.size(); ++c) {
+            SSTSourceTerms s = compute_sst_source_terms(rho0, k[c], omega[c], nu, wall_distance[c], Gradient2{},
+                                                          Gradient2{}, Gradient2{}, Gradient2{},
+                                                          SSTLimiterVariant::Vorticity);
+            if (s.k_production != 0.0 || s.k_destruction != 0.0 || s.omega_production != 0.0 ||
+                s.omega_destruction != 0.0 || s.cross_diffusion != 0.0) {
+                test1_zero_source = false;
+            }
+            k[c] += dt * (s.k_production - s.k_destruction);
+            omega[c] += dt * (s.omega_production - s.omega_destruction + s.cross_diffusion);
+        }
+    }
+    bool test1_stayed_zero = std::all_of(k.begin(), k.end(), [](double v) { return v == 0.0; }) &&
+                              std::all_of(omega.begin(), omega.end(), [](double v) { return v == 0.0; });
+
+    std::cout << "SST source-term verification: " << n_x << "x" << n_y << " sheared mesh (" << mesh.cells.size()
+               << " cells)\n"
+               << "  Test 1 (zero mean-flow, k=omega=0): all source terms exactly 0 every step = "
+               << (test1_zero_source ? "yes" : "no") << "; k/omega after " << nsteps << " steps = "
+               << (test1_stayed_zero ? "exactly 0" : "nonzero") << "\n";
+    bool test1_passed = test1_zero_source && test1_stayed_zero;
+    std::cout << (test1_passed ? "PASS" : "FAIL")
+               << ": k=omega=0 with zero mean flow must be an exact fixed point.\n";
+
+    // Test 2: manufactured linear velocity field + linear-in-y k/omega fields.
+    const double a = 0.1, b = 0.05, c_coef = 0.02, d_coef = -0.1; // u = a*x + b*y, v = c*x + d*y
+    const double exact_S = std::sqrt(2.0 * a * a + 2.0 * d_coef * d_coef + (b + c_coef) * (b + c_coef));
+    const double exact_Omega = std::fabs(c_coef - b);
+    const double k0 = 0.01, omega0 = 100.0; // k = k0*(1+y), omega = omega0*(1+y)
+
+    std::vector<double> u_field(mesh.cells.size()), v_field(mesh.cells.size());
+    std::vector<double> k2(mesh.cells.size()), omega2(mesh.cells.size());
+    for (size_t cc = 0; cc < mesh.cells.size(); ++cc) {
+        double x = mesh.cells[cc].x_centroid, y = mesh.cells[cc].y_centroid;
+        u_field[cc] = a * x + b * y;
+        v_field[cc] = c_coef * x + d_coef * y;
+        k2[cc] = k0 * (1.0 + y);
+        omega2[cc] = omega0 * (1.0 + y);
+    }
+    std::vector<double> boundary_u(mesh.faces.size(), 0.0), boundary_v(mesh.faces.size(), 0.0);
+    std::vector<double> boundary_k(mesh.faces.size(), 0.0), boundary_omega(mesh.faces.size(), 0.0);
+    for (size_t i = 0; i < mesh.faces.size(); ++i) {
+        if (mesh.faces[i].cell_right == -1) {
+            double x = mesh.faces[i].x_mid, y = mesh.faces[i].y_mid;
+            boundary_u[i] = a * x + b * y;
+            boundary_v[i] = c_coef * x + d_coef * y;
+            boundary_k[i] = k0 * (1.0 + y);
+            boundary_omega[i] = omega0 * (1.0 + y);
+        }
+    }
+    GradientCalculator grad_calc(mesh, GradientScheme::LeastSquares);
+    std::vector<Gradient2> grad_u = grad_calc.compute(mesh, u_field, boundary_u);
+    std::vector<Gradient2> grad_v = grad_calc.compute(mesh, v_field, boundary_v);
+    std::vector<Gradient2> grad_k = grad_calc.compute(mesh, k2, boundary_k);
+    std::vector<Gradient2> grad_omega = grad_calc.compute(mesh, omega2, boundary_omega);
+
+    size_t near_wall_cell = 0, far_wall_cell = 0;
+    for (size_t cc = 1; cc < mesh.cells.size(); ++cc) {
+        if (wall_distance[cc] < wall_distance[near_wall_cell]) near_wall_cell = cc;
+        if (wall_distance[cc] > wall_distance[far_wall_cell]) far_wall_cell = cc;
+    }
+
+    bool test2_passed = true;
+    double max_S_error = 0.0, max_Omega_error = 0.0;
+    double max_kprod_error = 0.0, max_kdest_error = 0.0, max_omegaprod_error = 0.0, max_omegadest_error = 0.0,
+           max_crossdiff_error = 0.0;
+    SSTSourceTerms s_near{}, s_far{};
+    for (SSTLimiterVariant variant : {SSTLimiterVariant::Vorticity, SSTLimiterVariant::StrainRate}) {
+        double variant_max_S_error = 0.0, variant_max_Omega_error = 0.0;
+        for (size_t cc = 0; cc < mesh.cells.size(); ++cc) {
+            SSTSourceTerms s = compute_sst_source_terms(rho0, k2[cc], omega2[cc], nu, wall_distance[cc], grad_u[cc],
+                                                          grad_v[cc], grad_k[cc], grad_omega[cc], variant);
+            variant_max_S_error = std::max(variant_max_S_error, std::fabs(s.S - exact_S));
+            variant_max_Omega_error = std::max(variant_max_Omega_error, std::fabs(s.Omega - exact_Omega));
+
+            bool finite = std::isfinite(s.k_production) && std::isfinite(s.k_destruction) &&
+                          std::isfinite(s.omega_production) && std::isfinite(s.omega_destruction) &&
+                          std::isfinite(s.cross_diffusion);
+            bool sane_sign = (s.k_production >= 0.0) && (s.k_destruction >= 0.0) && (s.omega_production >= 0.0) &&
+                             (s.omega_destruction >= 0.0) && (s.cross_diffusion >= 0.0);
+            if (!finite || !sane_sign) test2_passed = false;
+
+            // Independent re-aggregation from the RETURNED intermediates (S/Omega/F1/F2/nu_t),
+            // per this function's own methodology comment above.
+            double mu_t = rho0 * s.nu_t;
+            double beta_star_rho_omega_k = 0.09 * rho0 * omega2[cc] * k2[cc];
+            double clip_coef = (variant == SSTLimiterVariant::Vorticity) ? 20.0 : 10.0;
+            double expected_kprod = std::min(mu_t * s.S * s.S, clip_coef * beta_star_rho_omega_k);
+            double expected_kdest = beta_star_rho_omega_k;
+            double gamma1 = 0.075 / 0.09 - 0.5 * 0.41 * 0.41 / std::sqrt(0.09);
+            double gamma2 = 0.0828 / 0.09 - 0.856 * 0.41 * 0.41 / std::sqrt(0.09);
+            double gamma = s.F1 * gamma1 + (1.0 - s.F1) * gamma2;
+            double beta = s.F1 * 0.075 + (1.0 - s.F1) * 0.0828;
+            double expected_omegaprod = gamma * rho0 * s.S * s.S;
+            double expected_omegadest = beta * rho0 * omega2[cc] * omega2[cc];
+            double grad_dot = grad_k[cc].dphidx * grad_omega[cc].dphidx + grad_k[cc].dphidy * grad_omega[cc].dphidy;
+            double expected_crossdiff = 2.0 * (1.0 - s.F1) * rho0 * 0.856 * grad_dot / omega2[cc];
+
+            max_kprod_error = std::max(max_kprod_error, std::fabs(s.k_production - expected_kprod));
+            max_kdest_error = std::max(max_kdest_error, std::fabs(s.k_destruction - expected_kdest));
+            max_omegaprod_error = std::max(max_omegaprod_error, std::fabs(s.omega_production - expected_omegaprod));
+            max_omegadest_error = std::max(max_omegadest_error, std::fabs(s.omega_destruction - expected_omegadest));
+            max_crossdiff_error = std::max(max_crossdiff_error, std::fabs(s.cross_diffusion - expected_crossdiff));
+
+            if (cc == near_wall_cell) s_near = s;
+            if (cc == far_wall_cell) s_far = s;
+        }
+        max_S_error = std::max(max_S_error, variant_max_S_error);
+        max_Omega_error = std::max(max_Omega_error, variant_max_Omega_error);
+
+        std::cout << "  Test 2 (" << (variant == SSTLimiterVariant::Vorticity ? "Vorticity" : "StrainRate")
+                   << " limiter): max|S-exact|=" << variant_max_S_error << ", max|Omega-exact|=" << variant_max_Omega_error
+                   << "\n    near-wall (d=" << wall_distance[near_wall_cell] << ") F1=" << s_near.F1
+                   << ", F2=" << s_near.F2 << "; far-wall (d=" << wall_distance[far_wall_cell] << ") F1=" << s_far.F1
+                   << ", F2=" << s_far.F2 << "\n";
+
+        if (s_near.F1 < 0.99 || s_near.F2 < 0.99) test2_passed = false;
+        if (s_far.F1 > 0.01 || s_far.F2 > 0.01) test2_passed = false;
+    }
+
+    // Standalone check that the two SSTLimiterVariant options actually differ,
+    // via sst_eddy_viscosity() directly rather than through the field above --
+    // every cell in that field has omega large enough that the a1*omega floor
+    // dominates max(a1*omega, limiter*F2) for BOTH variants regardless of
+    // limiter choice, which would make this check pass vacuously there. Hand-
+    // picked k=1, omega=1 (a1*omega=0.31, small) with F2=1 (as if at the wall)
+    // and S=1.0, Omega=0.1 (deliberately far apart) forces the limiter term to
+    // dominate for at least the StrainRate variant, exercising the switch for real:
+    //   Vorticity:  max(0.31, 0.1*1) = 0.31 (a1*omega wins) -> nu_t = 0.31*1/0.31 = 1.0
+    //   StrainRate: max(0.31, 1.0*1) = 1.0  (limiter wins)  -> nu_t = 0.31*1/1.0  = 0.31
+    double nut_vorticity = sst_eddy_viscosity(1.0, 1.0, /*S=*/1.0, /*Omega=*/0.1, /*F2=*/1.0, SSTLimiterVariant::Vorticity);
+    double nut_strainrate = sst_eddy_viscosity(1.0, 1.0, /*S=*/1.0, /*Omega=*/0.1, /*F2=*/1.0, SSTLimiterVariant::StrainRate);
+    double nut_error = std::fabs(nut_vorticity - 1.0) + std::fabs(nut_strainrate - 0.31);
+    bool variants_differ = nut_error < 1e-9;
+
+    std::cout << "  max production/destruction/cross-diffusion re-aggregation error: kprod=" << max_kprod_error
+               << ", kdest=" << max_kdest_error << ", omegaprod=" << max_omegaprod_error
+               << ", omegadest=" << max_omegadest_error << ", crossdiff=" << max_crossdiff_error << "\n"
+               << "  standalone limiter check: nu_t(Vorticity)=" << nut_vorticity << " (expect 1.0), nu_t(StrainRate)="
+               << nut_strainrate << " (expect 0.31)\n";
+
+    const double tight_tol = 1e-9, formula_tol = 1e-6;
+    if (max_S_error > tight_tol || max_Omega_error > tight_tol) test2_passed = false;
+    if (max_kprod_error > formula_tol || max_kdest_error > formula_tol || max_omegaprod_error > formula_tol ||
+        max_omegadest_error > formula_tol || max_crossdiff_error > formula_tol) {
+        test2_passed = false;
+    }
+    if (!variants_differ) test2_passed = false;
+
+    std::cout << (test2_passed ? "PASS" : "FAIL")
+               << ": exact S/Omega, sane finite non-negative terms, self-consistent aggregation, F1/F2's "
+               << "near-wall/far-field asymptotic limits, and a real effect from SSTLimiterVariant.\n";
+
+    return test1_passed && test2_passed;
+}
+
 // Runs Phase 3 of the RANS (Spalart-Allmaras) plan's own verification gate:
-// RANSFVMSolver's "does the plumbing hold together" stability check, per
+// RANSTurbulenceSASolver's "does the plumbing hold together" stability check, per
 // docs/archive/rans-spalart-allmaras-tracker.md Phase 3's "planned verification" --
 // deliberately NOT a log-law accuracy check (that's Phase 4's job). Reuses
 // run_verify_couette()'s exact 1x16 sheared-mesh planar Couette setup
@@ -1706,7 +2773,7 @@ bool run_verify_rans_stability() {
     build_sheared_verification_mesh(mesh, n_x, n_y, shear);
     mesh.compute_geometry();
 
-    std::vector<RANSBoundaryCondition> bcs(mesh.patches.size());
+    std::vector<RANSBoundaryConditionSA> bcs(mesh.patches.size());
     bcs[0].ns.type = NSBoundaryType::NoSlipWall; // bottom: stationary
     bcs[1].ns.type = NSBoundaryType::Outflow;    // left
     bcs[2].ns.type = NSBoundaryType::NoSlipWall; // top: moving
@@ -1717,7 +2784,7 @@ bool run_verify_rans_stability() {
     ic.mode = EulerICMode::Freestream;
     ic.rho = rho0; ic.u = 0.0; ic.v = 0.0; ic.p = p0;
 
-    RANSFVMSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, initial_nut,
+    RANSTurbulenceSASolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, initial_nut,
                           NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares, 1e-6, 20);
 
     double residual_at_half = 0.0, nut_residual_at_half = 0.0;
@@ -1726,7 +2793,7 @@ bool run_verify_rans_stability() {
         solver.step();
         const EulerResidualNorms& r = solver.residual();
         double nr = solver.nut_residual();
-        if (std::isnan(r.rho_u) || std::isinf(r.rho_u) || std::isnan(nr) || std::isinf(nr)) {
+        if (is_nan_or_inf(r.rho_u) || is_nan_or_inf(nr)) {
             std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
             return false;
         }
@@ -1761,6 +2828,175 @@ bool run_verify_rans_stability() {
     std::cout << (settling ? "PASS" : "FAIL")
                << ": both residuals must decay to a settled state (not diverge or persistently oscillate).\n";
     return settling;
+}
+
+// Runs Phase 2 of the SST tracker's own verification gate (docs/sst-komega-tracker.md):
+// RANSTurbulenceSSTSolver's "does the plumbing hold together" stability check,
+// mirroring run_verify_rans_stability()'s methodology exactly (same 1x16
+// sheared-mesh planar Couette setup, same "stays finite and settles" bar,
+// deliberately NOT a log-law accuracy check). Run once per SSTLimiterVariant,
+// per this tracker's Phase 1 decision to support both rather than pick one.
+//
+// Input:  none
+// Output: prints final mean-flow/k/omega residuals and k/omega's min/max
+//         across the mesh, per variant
+// Returns: true if both variants complete all steps without NaN/Inf and
+//          settle (see run_verify_rans_stability()'s identical rationale for
+//          why this is an absolute, not relative, threshold); false otherwise
+bool run_verify_sst_stability() {
+    const int n_x = 1, n_y = 16;
+    const double shear = 0.3;
+    const double gamma = 1.4, gas_constant = 1.0, mu = 0.02, prandtl = 0.72, prandtl_t = 0.9, cfl = 0.3;
+    const double rho0 = 1.0, p0 = 1.0, U = 0.1;
+    const double initial_k = 1e-4, initial_omega = 1.0;
+    const int nsteps = 20000;
+
+    bool all_passed = true;
+    for (SSTLimiterVariant variant : {SSTLimiterVariant::Vorticity, SSTLimiterVariant::StrainRate}) {
+        UnstructuredMesh mesh;
+        build_sheared_verification_mesh(mesh, n_x, n_y, shear);
+        mesh.compute_geometry();
+
+        std::vector<RANSBoundaryConditionSST> bcs(mesh.patches.size());
+        bcs[0].ns.type = NSBoundaryType::NoSlipWall; // bottom: stationary
+        bcs[1].ns.type = NSBoundaryType::Outflow;    // left
+        bcs[2].ns.type = NSBoundaryType::NoSlipWall; // top: moving
+        bcs[2].ns.wall_u = U;
+        bcs[3].ns.type = NSBoundaryType::Outflow;    // right
+
+        EulerInitialCondition ic;
+        ic.mode = EulerICMode::Freestream;
+        ic.rho = rho0; ic.u = 0.0; ic.v = 0.0; ic.p = p0;
+
+        RANSTurbulenceSSTSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, initial_k,
+                                         initial_omega, NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares,
+                                         1e-6, 20, variant);
+
+        double residual_at_half = 0.0, k_residual_at_half = 0.0, omega_residual_at_half = 0.0;
+        int last_step = 0;
+        bool diverged = false;
+        for (; last_step < nsteps; ++last_step) {
+            solver.step();
+            const EulerResidualNorms& r = solver.residual();
+            double kr = solver.k_residual();
+            double wr = solver.omega_residual();
+            if (is_nan_or_inf(r.rho_u) || is_nan_or_inf(kr) || is_nan_or_inf(wr)) {
+                std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
+                diverged = true;
+                break;
+            }
+            if (last_step + 1 == nsteps / 2) {
+                residual_at_half = r.rho_u;
+                k_residual_at_half = kr;
+                omega_residual_at_half = wr;
+            }
+        }
+
+        std::cout << "SST stability verification (" << (variant == SSTLimiterVariant::Vorticity ? "Vorticity" : "StrainRate")
+                   << " limiter): " << n_x << "x" << n_y << " sheared mesh (" << mesh.cells.size()
+                   << " cells), U = " << U << ", mu = " << mu << ", initial k = " << initial_k
+                   << ", initial omega = " << initial_omega << "\n";
+
+        if (diverged) {
+            all_passed = false;
+            continue;
+        }
+
+        std::cout << "  Simulation completed across " << last_step << " steps.\n";
+
+        const EulerResidualNorms& r = solver.residual();
+        double kr = solver.k_residual();
+        double wr = solver.omega_residual();
+        const std::vector<double>& k_field = solver.k_field();
+        const std::vector<double>& omega_field = solver.omega_field();
+        double min_k = *std::min_element(k_field.begin(), k_field.end());
+        double max_k = *std::max_element(k_field.begin(), k_field.end());
+        double min_omega = *std::min_element(omega_field.begin(), omega_field.end());
+        double max_omega = *std::max_element(omega_field.begin(), omega_field.end());
+
+        std::cout << "  rho_u residual:   " << residual_at_half << " (step " << nsteps / 2 << ") -> " << r.rho_u
+                   << " (final)\n"
+                   << "  k residual:       " << k_residual_at_half << " (step " << nsteps / 2 << ") -> " << kr
+                   << " (final)\n"
+                   << "  omega residual:   " << omega_residual_at_half << " (step " << nsteps / 2 << ") -> " << wr
+                   << " (final)\n"
+                   << "  k range:     [" << min_k << ", " << max_k << "]\n"
+                   << "  omega range: [" << min_omega << ", " << max_omega << "]\n";
+
+        // Same absolute-threshold rationale as run_verify_rans_stability():
+        // once residuals decay into floating-point noise, a relative
+        // comparison to the halfway value stops being meaningful.
+        bool settling = (r.rho_u < 1e-6) && (kr < 1e-6) && (wr < 1e-6);
+        std::cout << (settling ? "PASS" : "FAIL")
+                   << ": mean-flow/k/omega residuals must all decay to a settled state.\n";
+        if (!settling) all_passed = false;
+    }
+
+    // Extends coverage to a Farfield boundary, per this tracker's Phase 3
+    // "planned verification" note that the Couette-only setup above leaves
+    // farfield_k/farfield_omega completely untested -- same gap the SA
+    // tracker's own Phase 3 flagged for farfield_nut at the time. Reuses the
+    // same mesh/walls, replacing the left Outflow patch with a Farfield
+    // inflow carrying prescribed farfield_k/farfield_omega. One variant only
+    // (Vorticity) -- this is a plumbing check (does a Farfield k/omega value
+    // actually get consumed without diverging), not a second full sweep.
+    {
+        UnstructuredMesh mesh;
+        build_sheared_verification_mesh(mesh, n_x, n_y, shear);
+        mesh.compute_geometry();
+
+        const double farfield_k = 1e-4, farfield_omega = 10.0;
+
+        std::vector<RANSBoundaryConditionSST> bcs(mesh.patches.size());
+        bcs[0].ns.type = NSBoundaryType::NoSlipWall; // bottom: stationary
+        bcs[1].ns.type = NSBoundaryType::Farfield;   // left: prescribed inflow
+        bcs[1].ns.farfield_state = from_primitive(rho0, U, 0.0, p0, gamma);
+        bcs[1].farfield_k = farfield_k;
+        bcs[1].farfield_omega = farfield_omega;
+        bcs[2].ns.type = NSBoundaryType::NoSlipWall; // top: stationary
+        bcs[3].ns.type = NSBoundaryType::Outflow;    // right
+
+        EulerInitialCondition ic;
+        ic.mode = EulerICMode::Freestream;
+        ic.rho = rho0; ic.u = U; ic.v = 0.0; ic.p = p0;
+
+        RANSTurbulenceSSTSolver solver(mesh, bcs, gamma, gas_constant, mu, prandtl, prandtl_t, cfl, ic, farfield_k,
+                                         farfield_omega, NumericalFluxScheme::Rusanov, GradientScheme::LeastSquares,
+                                         1e-6, 20, SSTLimiterVariant::Vorticity);
+
+        bool diverged = false;
+        int last_step = 0;
+        for (; last_step < nsteps; ++last_step) {
+            solver.step();
+            const EulerResidualNorms& r = solver.residual();
+            double kr = solver.k_residual();
+            double wr = solver.omega_residual();
+            if (is_nan_or_inf(r.rho_u) || is_nan_or_inf(kr) || is_nan_or_inf(wr)) {
+                diverged = true;
+                break;
+            }
+        }
+
+        std::cout << "SST stability verification (Farfield boundary, Vorticity limiter): " << n_x << "x" << n_y
+                   << " sheared mesh (" << mesh.cells.size() << " cells), farfield_k = " << farfield_k
+                   << ", farfield_omega = " << farfield_omega << "\n";
+        if (diverged) {
+            std::cout << "Diverged (NaN/Inf residual) at step " << last_step + 1 << "\n";
+            all_passed = false;
+        } else {
+            const EulerResidualNorms& r = solver.residual();
+            double kr = solver.k_residual();
+            double wr = solver.omega_residual();
+            bool settling = (r.rho_u < 1e-6) && (kr < 1e-6) && (wr < 1e-6);
+            std::cout << "  Simulation completed across " << last_step << " steps.\n"
+                       << "  rho_u residual -> " << r.rho_u << ", k residual -> " << kr << ", omega residual -> " << wr
+                       << "\n"
+                       << (settling ? "PASS" : "FAIL") << ": must settle with a live Farfield k/omega boundary.\n";
+            if (!settling) all_passed = false;
+        }
+    }
+
+    return all_passed;
 }
 
 // Runs the scalar diffusion solver, driving its step loop directly so a
@@ -1808,6 +3044,9 @@ bool run_diffusion(const CaseInput& case_input, UnstructuredMesh& mesh) {
     // Apply boundary conditions from the case file to the mesh patches, matched by
     // name; a patch with no matching "boundary" entry keeps its default
     // (Dirichlet, 0.0) and a warning is printed.
+    if (!validate_boundary_condition_specs(case_input.boundary_conditions, mesh.patches)) {
+        return false;
+    }
     for (auto& patch : mesh.patches) {
         bool matched = false;
         for (const auto& bc : case_input.boundary_conditions) {
@@ -1863,13 +3102,14 @@ bool run_diffusion(const CaseInput& case_input, UnstructuredMesh& mesh) {
         last_completed_step = step_index;
 
         double residual = solver.residual_norm();
-        if (std::isnan(residual) || std::isinf(residual)) {
+        if (is_nan_or_inf(residual)) {
             diverged = true;
             break;
         }
 
         if (tracking_residual && step_index % case_input.residual_interval == 0) {
             residual_out << step_index << "," << residual << "\n";
+            residual_out.flush();
         }
         if (case_input.write_interval > 0 && step_index % case_input.write_interval == 0) {
             VtkWriter::write(numbered_filename(case_input.output_file, step_index), mesh, solver.field(),
@@ -1930,6 +3170,9 @@ bool run_advection_diffusion(const CaseInput& case_input, UnstructuredMesh& mesh
     ensure_parent_directory(case_input.checkpoint_file);
     ensure_parent_directory(case_input.residual_file);
 
+    if (!validate_boundary_condition_specs(case_input.boundary_conditions, mesh.patches)) {
+        return false;
+    }
     for (auto& patch : mesh.patches) {
         bool matched = false;
         for (const auto& bc : case_input.boundary_conditions) {
@@ -1983,13 +3226,14 @@ bool run_advection_diffusion(const CaseInput& case_input, UnstructuredMesh& mesh
         last_completed_step = step_index;
 
         double residual = solver.residual_norm();
-        if (std::isnan(residual) || std::isinf(residual)) {
+        if (is_nan_or_inf(residual)) {
             diverged = true;
             break;
         }
 
         if (tracking_residual && step_index % case_input.residual_interval == 0) {
             residual_out << step_index << "," << residual << "\n";
+            residual_out.flush();
         }
         if (case_input.write_interval > 0 && step_index % case_input.write_interval == 0) {
             VtkWriter::write(numbered_filename(case_input.output_file, step_index), mesh, solver.field(),
@@ -2121,6 +3365,9 @@ bool run_euler(const CaseInput& case_input, const UnstructuredMesh& mesh) {
     // matched by name; a patch with no matching "boundary" entry defaults to
     // Wall, the conservative choice (it cannot leak or inject mass/energy
     // through an unconfigured boundary), and a warning is printed.
+    if (!validate_boundary_condition_specs(case_input.euler_boundary_conditions, mesh.patches)) {
+        return false;
+    }
     std::vector<EulerBoundaryCondition> bcs(mesh.patches.size());
     for (size_t i = 0; i < mesh.patches.size(); ++i) {
         bool matched = false;
@@ -2142,6 +3389,19 @@ bool run_euler(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 
     EulerFVMSolver solver(mesh, bcs, case_input.gamma, case_input.cfl, case_input.euler_ic, case_input.flux_scheme,
                            case_input.exact_riemann_tol, case_input.exact_riemann_max_iter);
+
+    // Residual-based CFL ramping (see CflRamp.h): starts at cfl_ramp.cfl_min
+    // instead of the constructor's case_input.cfl ceiling, and next_cfl()
+    // grows/holds/shrinks current_cfl toward that ceiling every step based on
+    // the density residual's windowed trend. A checkpoint resume restarts the
+    // ramp at cfl_min every time (documented limitation, see docs/MANUAL.md) --
+    // ramp state itself is not part of the checkpoint payload.
+    double current_cfl = case_input.cfl;
+    std::vector<double> cfl_residual_history;
+    if (case_input.cfl_mode == CflMode::Ramp) {
+        current_cfl = case_input.cfl_ramp.cfl_min;
+        solver.set_cfl(current_cfl);
+    }
 
     // Auto-resume: if a checkpoint from a previous invocation of this same
     // case file already exists, pick up where it left off instead of
@@ -2184,15 +3444,25 @@ bool run_euler(const CaseInput& case_input, const UnstructuredMesh& mesh) {
         last_completed_step = step_index;
 
         const EulerResidualNorms& r = solver.residual();
-        if (std::isnan(r.rho) || std::isinf(r.rho) || std::isnan(r.rho_u) || std::isinf(r.rho_u) ||
-            std::isnan(r.rho_v) || std::isinf(r.rho_v) || std::isnan(r.E) || std::isinf(r.E)) {
+        if (is_nan_or_inf(r.rho) || is_nan_or_inf(r.rho_u) ||
+            is_nan_or_inf(r.rho_v) || is_nan_or_inf(r.E)) {
             diverged = true;
             break;
+        }
+
+        if (case_input.cfl_mode == CflMode::Ramp) {
+            cfl_residual_history.push_back(r.rho);
+            if (static_cast<int>(cfl_residual_history.size()) > case_input.cfl_ramp.window) {
+                cfl_residual_history.erase(cfl_residual_history.begin());
+            }
+            current_cfl = next_cfl(current_cfl, case_input.cfl, cfl_residual_history, case_input.cfl_ramp);
+            solver.set_cfl(current_cfl);
         }
 
         if (tracking_residual && step_index % case_input.residual_interval == 0) {
             residual_out << step_index << "," << r.rho << "," << r.rho_u << ","
                          << r.rho_v << "," << r.E << "\n";
+            residual_out.flush();
         }
         if (case_input.write_interval > 0 && step_index % case_input.write_interval == 0) {
             write_euler_fields(numbered_filename(case_input.output_file, step_index), mesh,
@@ -2289,6 +3559,9 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
     ensure_parent_directory(case_input.wall_forces_file);
     ensure_parent_directory(case_input.wall_profile_file);
 
+    if (!validate_boundary_condition_specs(case_input.ns_boundary_conditions, mesh.patches)) {
+        return false;
+    }
     std::vector<NSBoundaryCondition> bcs(mesh.patches.size());
     for (size_t i = 0; i < mesh.patches.size(); ++i) {
         bool matched = false;
@@ -2316,6 +3589,14 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
                                   case_input.prandtl, case_input.cfl, case_input.ns_ic, case_input.flux_scheme,
                                   case_input.gradient_scheme, case_input.exact_riemann_tol,
                                   case_input.exact_riemann_max_iter);
+
+    // Residual-based CFL ramping -- see run_euler()'s identical comment above.
+    double current_cfl = case_input.cfl;
+    std::vector<double> cfl_residual_history;
+    if (case_input.cfl_mode == CflMode::Ramp) {
+        current_cfl = case_input.cfl_ramp.cfl_min;
+        solver.set_cfl(current_cfl);
+    }
 
     bool checkpointing = !case_input.checkpoint_file.empty();
     long long resume_start = 1;
@@ -2402,15 +3683,25 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
         last_completed_step = step_index;
 
         const EulerResidualNorms& r = solver.residual();
-        if (std::isnan(r.rho) || std::isinf(r.rho) || std::isnan(r.rho_u) || std::isinf(r.rho_u) ||
-            std::isnan(r.rho_v) || std::isinf(r.rho_v) || std::isnan(r.E) || std::isinf(r.E)) {
+        if (is_nan_or_inf(r.rho) || is_nan_or_inf(r.rho_u) ||
+            is_nan_or_inf(r.rho_v) || is_nan_or_inf(r.E)) {
             diverged = true;
             break;
+        }
+
+        if (case_input.cfl_mode == CflMode::Ramp) {
+            cfl_residual_history.push_back(r.rho);
+            if (static_cast<int>(cfl_residual_history.size()) > case_input.cfl_ramp.window) {
+                cfl_residual_history.erase(cfl_residual_history.begin());
+            }
+            current_cfl = next_cfl(current_cfl, case_input.cfl, cfl_residual_history, case_input.cfl_ramp);
+            solver.set_cfl(current_cfl);
         }
 
         if (tracking_residual && step_index % case_input.residual_interval == 0) {
             residual_out << step_index << "," << r.rho << "," << r.rho_u << ","
                          << r.rho_v << "," << r.E << "\n";
+            residual_out.flush();
         }
         if (tracking_resolution && step_index % case_input.resolution_report_interval == 0) {
             ResolutionDiagnostics diag = solver.compute_resolution_diagnostics();
@@ -2421,6 +3712,7 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
             std::vector<WallFaceSample> samples = solver.compute_wall_traction_samples(wall_faces);
             std::vector<WallForceReport> reports = compute_wall_forces(mesh, samples, wall_ref);
             write_wall_forces_rows(wall_forces_out, step_index, mesh, reports);
+            wall_forces_out.flush();
         }
         if (tracking_wall_profile && case_input.wall_profile_interval > 0 &&
             step_index % case_input.wall_profile_interval == 0) {
@@ -2496,7 +3788,7 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
 //         mu           - molecular dynamic viscosity, needed to derive nu_t from nut
 //         sa_constants - SA model constants used to derive nu_t (see SpalartAllmaras.h)
 // Output/Returns: same contract as write_euler_fields()
-bool write_rans_fields(const std::string& filename, const UnstructuredMesh& mesh, const std::vector<EulerState>& U,
+bool write_ransSA_fields(const std::string& filename, const UnstructuredMesh& mesh, const std::vector<EulerState>& U,
                          const std::vector<double>& nut, double gamma, double gas_constant, double mu,
                          const SAModelConstants& sa_constants, int precision) {
     NamedField rho{"rho", {}}, u{"u", {}}, v{"v", {}}, p{"p", {}}, mach{"mach", {}}, T{"T", {}};
@@ -2524,25 +3816,28 @@ bool write_rans_fields(const std::string& filename, const UnstructuredMesh& mesh
 // run_navier_stokes() above (same checkpointing, residual tracking/
 // convergence, wall-diagnostics wiring, and stopping-criteria handling),
 // plus: matching per-patch boundary conditions from
-// case_input.rans_boundary_conditions (defaulting an unmatched patch to
-// rans_wall, adiabatic -- same conservative default as Navier-Stokes),
-// constructing RANSFVMSolver with its extra prandtl_t/initial_nut/sa_constants
+// case_input.ransSA_boundary_conditions (defaulting an unmatched patch to
+// ransSA_wall, adiabatic -- same conservative default as Navier-Stokes),
+// constructing RANSTurbulenceSASolver with its extra prandtl_t/initial_nut/sa_constants
 // parameters, tracking the nut residual alongside rho/rho_u/rho_v/E, and
-// tagging checkpoints with CheckpointEquation::RANS (which round-trips both
+// tagging checkpoints with CheckpointEquation::RANS_SA (which round-trips both
 // U and nut, unlike ::NavierStokes's U-only payload).
 //
 // Input/Output/Returns: same contract as run_navier_stokes().
-bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
+bool run_ransSA(const CaseInput& case_input, const UnstructuredMesh& mesh) {
     ensure_parent_directory(case_input.output_file);
     ensure_parent_directory(case_input.checkpoint_file);
     ensure_parent_directory(case_input.residual_file);
     ensure_parent_directory(case_input.wall_forces_file);
     ensure_parent_directory(case_input.wall_profile_file);
 
-    std::vector<RANSBoundaryCondition> bcs(mesh.patches.size());
+    if (!validate_boundary_condition_specs(case_input.ransSA_boundary_conditions, mesh.patches)) {
+        return false;
+    }
+    std::vector<RANSBoundaryConditionSA> bcs(mesh.patches.size());
     for (size_t i = 0; i < mesh.patches.size(); ++i) {
         bool matched = false;
-        for (const auto& bc : case_input.rans_boundary_conditions) {
+        for (const auto& bc : case_input.ransSA_boundary_conditions) {
             if (bc.patch_name == mesh.patches[i].name) {
                 bcs[i].ns.type = bc.type;
                 bcs[i].ns.wall_u = bc.wall_u;
@@ -2559,14 +3854,22 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
         }
         if (!matched) {
             std::cerr << "Warning: no boundary condition specified for patch '" << mesh.patches[i].name
-                       << "', defaulting to rans_wall (adiabatic no-slip)\n";
+                       << "', defaulting to ransSA_wall (adiabatic no-slip)\n";
         }
     }
 
-    RANSFVMSolver solver(mesh, bcs, case_input.gamma, case_input.gas_constant, case_input.mu, case_input.prandtl,
-                          case_input.prandtl_t, case_input.cfl, case_input.rans_ic, case_input.initial_nut,
+    RANSTurbulenceSASolver solver(mesh, bcs, case_input.gamma, case_input.gas_constant, case_input.mu, case_input.prandtl,
+                          case_input.prandtl_t, case_input.cfl, case_input.ransSA_ic, case_input.initial_nut,
                           case_input.flux_scheme, case_input.gradient_scheme, case_input.exact_riemann_tol,
                           case_input.exact_riemann_max_iter, case_input.sa_constants);
+
+    // Residual-based CFL ramping -- see run_euler()'s identical comment above.
+    double current_cfl = case_input.cfl;
+    std::vector<double> cfl_residual_history;
+    if (case_input.cfl_mode == CflMode::Ramp) {
+        current_cfl = case_input.cfl_ramp.cfl_min;
+        solver.set_cfl(current_cfl);
+    }
 
     bool checkpointing = !case_input.checkpoint_file.empty();
     long long resume_start = 1;
@@ -2575,7 +3878,7 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
         unsigned long long resumed_build = 0;
         std::vector<EulerState> resumed_field;
         std::vector<double> resumed_nut;
-        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS, mesh.cells.size(), resumed_step,
+        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS_SA, mesh.cells.size(), resumed_step,
                                resumed_build, resumed_field, resumed_nut)) {
             return false;
         }
@@ -2641,21 +3944,32 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 
         const EulerResidualNorms& r = solver.residual();
         double nr = solver.nut_residual();
-        if (std::isnan(r.rho) || std::isinf(r.rho) || std::isnan(r.rho_u) || std::isinf(r.rho_u) ||
-            std::isnan(r.rho_v) || std::isinf(r.rho_v) || std::isnan(r.E) || std::isinf(r.E) ||
-            std::isnan(nr) || std::isinf(nr)) {
+        if (is_nan_or_inf(r.rho) || is_nan_or_inf(r.rho_u) ||
+            is_nan_or_inf(r.rho_v) || is_nan_or_inf(r.E) ||
+            is_nan_or_inf(nr)) {
             diverged = true;
             break;
+        }
+
+        if (case_input.cfl_mode == CflMode::Ramp) {
+            cfl_residual_history.push_back(r.rho);
+            if (static_cast<int>(cfl_residual_history.size()) > case_input.cfl_ramp.window) {
+                cfl_residual_history.erase(cfl_residual_history.begin());
+            }
+            current_cfl = next_cfl(current_cfl, case_input.cfl, cfl_residual_history, case_input.cfl_ramp);
+            solver.set_cfl(current_cfl);
         }
 
         if (tracking_residual && step_index % case_input.residual_interval == 0) {
             residual_out << step_index << "," << r.rho << "," << r.rho_u << ","
                          << r.rho_v << "," << r.E << "," << nr << "\n";
+            residual_out.flush();
         }
         if (tracking_wall_forces && step_index % case_input.wall_forces_interval == 0) {
             std::vector<WallFaceSample> samples = solver.compute_wall_traction_samples(wall_faces);
             std::vector<WallForceReport> reports = compute_wall_forces(mesh, samples, wall_ref);
             write_wall_forces_rows(wall_forces_out, step_index, mesh, reports);
+            wall_forces_out.flush();
         }
         if (tracking_wall_profile && case_input.wall_profile_interval > 0 &&
             step_index % case_input.wall_profile_interval == 0) {
@@ -2663,7 +3977,7 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
                                           case_input.output_precision, mesh, compute_wall_node_snapshot());
         }
         if (case_input.write_interval > 0 && step_index % case_input.write_interval == 0) {
-            write_rans_fields(numbered_filename(case_input.output_file, step_index), mesh, solver.field(),
+            write_ransSA_fields(numbered_filename(case_input.output_file, step_index), mesh, solver.field(),
                                 solver.nut_field(), case_input.gamma, case_input.gas_constant, case_input.mu,
                                 case_input.sa_constants, case_input.output_precision);
         }
@@ -2686,7 +4000,7 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 
     if (diverged) {
         std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
-        write_rans_fields(case_input.output_file, mesh, solver.field(), solver.nut_field(), case_input.gamma,
+        write_ransSA_fields(case_input.output_file, mesh, solver.field(), solver.nut_field(), case_input.gamma,
                             case_input.gas_constant, case_input.mu, case_input.sa_constants,
                             case_input.output_precision);
         if (tracking_wall_profile) {
@@ -2706,15 +4020,323 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 
     bool ran_any_step = last_completed_step >= resume_start;
     if (checkpointing && ran_any_step) {
-        if (!Checkpoint::write(case_input.checkpoint_file, CheckpointEquation::RANS, last_completed_step,
+        if (!Checkpoint::write(case_input.checkpoint_file, CheckpointEquation::RANS_SA, last_completed_step,
                                 FV_BUILD_NUMBER, solver.field(), solver.nut_field())) {
             std::cerr << "Warning: failed to write checkpoint file '" << case_input.checkpoint_file << "'\n";
         }
     }
 
-    if (!write_rans_fields(case_input.output_file, mesh, solver.field(), solver.nut_field(), case_input.gamma,
+    if (!write_ransSA_fields(case_input.output_file, mesh, solver.field(), solver.nut_field(), case_input.gamma,
                              case_input.gas_constant, case_input.mu, case_input.sa_constants,
                              case_input.output_precision)) {
+        std::cerr << "Failed to write output file: " << case_input.output_file << "\n";
+        return false;
+    }
+    if (tracking_wall_profile) {
+        write_wall_profile_snapshot(case_input.wall_profile_file, case_input.output_precision, mesh,
+                                      compute_wall_node_snapshot());
+    }
+    return true;
+}
+
+// Same derivation as write_navier_stokes_fields(), plus "k", "omega" (the two
+// transported SST scalars) and "nu_t" (the derived turbulent eddy viscosity,
+// see sst_eddy_viscosity() in SSTKOmega.h) -- this equation set's analogue of
+// write_ransSA_fields()'s "nut"/"nu_t" pair. nu_t here needs S/Omega/F2 (not
+// just k/omega/nu like SA's fv1), so it's recomputed from FRESH velocity
+// gradients here, same as RANSTurbulenceSSTSolver::compute_wall_traction_samples()
+// already does for the identical reason.
+//
+// Input:  filename, mesh, U, gamma, gas_constant, precision - same as write_navier_stokes_fields()
+//         k_field, omega_field - the transported k/omega fields, one per mesh.cells entry
+//         mu           - molecular dynamic viscosity, needed to derive nu_t
+//         variant      - which SSTLimiterVariant nu_t's limiter uses
+//         sst_constants - SST model constants used to derive F1/F2/nu_t (see SSTKOmega.h)
+// Output/Returns: same contract as write_euler_fields()
+bool write_ransSST_fields(const std::string& filename, const UnstructuredMesh& mesh,
+                           const std::vector<EulerState>& U, const std::vector<double>& k_field,
+                           const std::vector<double>& omega_field, double gamma, double gas_constant, double mu,
+                           SSTLimiterVariant variant, const SSTModelConstants& sst_constants,
+                           const std::vector<double>& wall_distance, GradientScheme gradient_scheme, int precision) {
+    const size_t N = U.size();
+    std::vector<double> u_field(N), v_field(N), boundary_u(mesh.faces.size(), 0.0), boundary_v(mesh.faces.size(), 0.0);
+    for (size_t c = 0; c < N; ++c) {
+        u_field[c] = U[c].rho_u / U[c].rho;
+        v_field[c] = U[c].rho_v / U[c].rho;
+    }
+    for (size_t i = 0; i < mesh.faces.size(); ++i) {
+        if (mesh.faces[i].cell_right == -1) {
+            int cl = mesh.faces[i].cell_left;
+            boundary_u[i] = u_field[cl];
+            boundary_v[i] = v_field[cl]; // zero-order extrapolation -- adequate for this diagnostic-only nu_t recompute
+        }
+    }
+    GradientCalculator grad_calc(mesh, gradient_scheme);
+    std::vector<Gradient2> grad_u = grad_calc.compute(mesh, u_field, boundary_u);
+    std::vector<Gradient2> grad_v = grad_calc.compute(mesh, v_field, boundary_v);
+
+    NamedField rho{"rho", {}}, u{"u", {}}, v{"v", {}}, p{"p", {}}, mach{"mach", {}}, T{"T", {}};
+    NamedField k_out{"k", {}}, omega_out{"omega", {}}, nu_t_field{"nu_t", {}};
+    for (size_t c = 0; c < N; ++c) {
+        const EulerState& state = U[c];
+        double vel_u = u_field[c], vel_v = v_field[c];
+        double pressure_value = pressure(state, gamma);
+        rho.values.push_back(state.rho);
+        u.values.push_back(vel_u);
+        v.values.push_back(vel_v);
+        p.values.push_back(pressure_value);
+        mach.values.push_back(std::sqrt(vel_u * vel_u + vel_v * vel_v) / sound_speed(state, gamma));
+        T.values.push_back(temperature(state, gamma, gas_constant));
+        k_out.values.push_back(k_field[c]);
+        omega_out.values.push_back(omega_field[c]);
+
+        double S = sst_strain_rate_magnitude(grad_u[c], grad_v[c]);
+        double Omega = sst_vorticity_magnitude(grad_u[c], grad_v[c]);
+        double nu_lam_c = mu / state.rho;
+        double F2c = sst_F2(k_field[c], omega_field[c], nu_lam_c, wall_distance[c], sst_constants);
+        double nu_t_c = sst_eddy_viscosity(k_field[c], omega_field[c], S, Omega, F2c, variant, sst_constants);
+        nu_t_field.values.push_back(nu_t_c);
+    }
+
+    return VtkWriter::write(filename, mesh,
+                              std::vector<NamedField>{rho, u, v, p, mach, T, k_out, omega_out, nu_t_field}, precision);
+}
+
+// Runs the RANS (k-omega SST) solver. Identical structure to run_ransSA()
+// above (same checkpointing, residual tracking/convergence, wall-diagnostics
+// wiring, and stopping-criteria handling), plus: matching per-patch boundary
+// conditions from case_input.ransSST_boundary_conditions (defaulting an
+// unmatched patch to ransSST_wall, adiabatic -- same conservative default as
+// RANS (Spalart-Allmaras)), constructing RANSTurbulenceSSTSolver with its
+// extra initial_k/initial_omega/sst_limiter_variant/sst_constants/
+// sst_kato_launder parameters, tracking the k/omega residuals alongside
+// rho/rho_u/rho_v/E, and tagging checkpoints with CheckpointEquation::RANS_SST
+// (which round-trips U, k, AND omega, unlike ::RANS_SA's dual-payload U+nut).
+//
+// write_ransSST_fields() needs the general wall-distance field (feeding F1/F2
+// at every cell, exactly as RANSTurbulenceSSTSolver's own construction does) --
+// recomputed here from wall_faces rather than exposed by the solver, matching
+// this function's own "recompute fresh, nothing retained" convention for
+// every other diagnostic-only quantity.
+//
+// Input/Output/Returns: same contract as run_navier_stokes().
+bool run_ransSST(const CaseInput& case_input, const UnstructuredMesh& mesh) {
+    ensure_parent_directory(case_input.output_file);
+    ensure_parent_directory(case_input.checkpoint_file);
+    ensure_parent_directory(case_input.residual_file);
+    ensure_parent_directory(case_input.wall_forces_file);
+    ensure_parent_directory(case_input.wall_profile_file);
+
+    if (!validate_boundary_condition_specs(case_input.ransSST_boundary_conditions, mesh.patches)) {
+        return false;
+    }
+    std::vector<RANSBoundaryConditionSST> bcs(mesh.patches.size());
+    for (size_t i = 0; i < mesh.patches.size(); ++i) {
+        bool matched = false;
+        for (const auto& bc : case_input.ransSST_boundary_conditions) {
+            if (bc.patch_name == mesh.patches[i].name) {
+                bcs[i].ns.type = bc.type;
+                bcs[i].ns.wall_u = bc.wall_u;
+                bcs[i].ns.wall_v = bc.wall_v;
+                bcs[i].ns.is_isothermal_wall = bc.is_isothermal_wall;
+                bcs[i].ns.wall_temperature = bc.wall_temperature;
+                if (bc.type == NSBoundaryType::Farfield) {
+                    bcs[i].ns.farfield_state = from_primitive(bc.rho, bc.u, bc.v, bc.p, case_input.gamma);
+                    bcs[i].farfield_k = bc.farfield_k;
+                    bcs[i].farfield_omega = bc.farfield_omega;
+                }
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            std::cerr << "Warning: no boundary condition specified for patch '" << mesh.patches[i].name
+                       << "', defaulting to ransSST_wall (adiabatic no-slip)\n";
+        }
+    }
+
+    RANSTurbulenceSSTSolver solver(mesh, bcs, case_input.gamma, case_input.gas_constant, case_input.mu,
+                                     case_input.prandtl, case_input.prandtl_t, case_input.cfl, case_input.ransSST_ic,
+                                     case_input.initial_k, case_input.initial_omega, case_input.flux_scheme,
+                                     case_input.gradient_scheme, case_input.exact_riemann_tol,
+                                     case_input.exact_riemann_max_iter, case_input.sst_limiter_variant,
+                                     case_input.sst_constants, case_input.sst_kato_launder);
+
+    // Residual-based CFL ramping -- see run_euler()'s identical comment above.
+    double current_cfl = case_input.cfl;
+    std::vector<double> cfl_residual_history;
+    if (case_input.cfl_mode == CflMode::Ramp) {
+        current_cfl = case_input.cfl_ramp.cfl_min;
+        solver.set_cfl(current_cfl);
+    }
+
+    bool checkpointing = !case_input.checkpoint_file.empty();
+    long long resume_start = 1;
+    if (checkpointing && Checkpoint::exists(case_input.checkpoint_file)) {
+        long long resumed_step = 0;
+        unsigned long long resumed_build = 0;
+        std::vector<EulerState> resumed_field;
+        std::vector<double> resumed_k, resumed_omega;
+        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS_SST, mesh.cells.size(), resumed_step,
+                               resumed_build, resumed_field, resumed_k, resumed_omega)) {
+            return false;
+        }
+        solver.set_field(resumed_field, resumed_k, resumed_omega);
+        resume_start = resumed_step + 1;
+        std::cout << "Resuming from checkpoint at step " << resumed_step
+                   << " (written by build " << resumed_build << ")\n";
+    }
+
+    bool tracking_residual = !case_input.residual_file.empty();
+    std::ofstream residual_out;
+    if (tracking_residual) {
+        residual_out.open(case_input.residual_file);
+        residual_out << std::setprecision(case_input.output_precision);
+        residual_out << "step,residual_rho,residual_rho_u,residual_rho_v,residual_E,residual_k,residual_omega\n";
+    }
+
+    bool tracking_wall_forces = !case_input.wall_forces_file.empty();
+    bool tracking_wall_profile = !case_input.wall_profile_file.empty();
+    std::vector<int> wall_faces;
+    WallReferenceQuantities wall_ref;
+    std::ofstream wall_forces_out;
+    if (tracking_wall_forces || tracking_wall_profile) {
+        wall_faces = collect_wall_faces(mesh, bcs);
+        wall_ref = build_wall_reference_quantities(case_input);
+    }
+    if (tracking_wall_forces) {
+        wall_forces_out.open(case_input.wall_forces_file);
+        wall_forces_out << std::setprecision(case_input.output_precision);
+        wall_forces_out << "step,patch,friction_drag,pressure_drag,total_drag,cd_friction,cd_pressure,cd_total,"
+                            "lift,cl,moment,cm\n";
+    }
+
+    double wall_bl_u_edge = std::hypot(wall_ref.velocity_x_ref, wall_ref.velocity_y_ref);
+    const int wall_bl_max_cells_per_march = 200;
+    double wall_bl_max_distance = (case_input.boundary_layer_max_distance > 0.0)
+                                       ? case_input.boundary_layer_max_distance
+                                       : mesh_bounding_box_diagonal(mesh);
+    auto compute_wall_node_snapshot = [&]() {
+        std::vector<WallFaceSample> samples = solver.compute_wall_traction_samples(wall_faces);
+        std::vector<BoundaryLayerProfile> profiles =
+            (case_input.boundary_layer_method == BoundaryLayerMethod::PointLocation)
+                ? solver.compute_boundary_layer_profile_samples_point_location(
+                      wall_faces, wall_bl_u_edge, wall_bl_max_distance, case_input.boundary_layer_n_samples)
+                : solver.compute_boundary_layer_profile_samples(wall_faces, wall_bl_u_edge,
+                                                                  wall_bl_max_cells_per_march);
+        return average_wall_samples_to_nodes(mesh, samples, wall_ref, profiles);
+    };
+
+    std::vector<int> all_wall_faces_for_output = collect_wall_faces(mesh, bcs);
+    std::vector<double> wall_distance_for_output = compute_wall_distance(mesh, all_wall_faces_for_output);
+
+    bool check_rho = case_input.residual_tolerance_rho >= 0.0;
+    bool check_rho_u = case_input.residual_tolerance_rho_u >= 0.0;
+    bool check_rho_v = case_input.residual_tolerance_rho_v >= 0.0;
+    bool check_E = case_input.residual_tolerance_E >= 0.0;
+    bool check_k = case_input.residual_tolerance_k >= 0.0;
+    bool check_omega = case_input.residual_tolerance_omega >= 0.0;
+    bool checking_convergence = check_rho || check_rho_u || check_rho_v || check_E || check_k || check_omega;
+
+    bool diverged = false, converged = false, interrupted = false;
+    long long last_completed_step = resume_start - 1;
+
+    for (long long step_index = resume_start; step_index <= case_input.nsteps; ++step_index) {
+        solver.step();
+        last_completed_step = step_index;
+
+        const EulerResidualNorms& r = solver.residual();
+        double kr = solver.k_residual();
+        double wr = solver.omega_residual();
+        if (is_nan_or_inf(r.rho) || is_nan_or_inf(r.rho_u) ||
+            is_nan_or_inf(r.rho_v) || is_nan_or_inf(r.E) ||
+            is_nan_or_inf(kr) || is_nan_or_inf(wr)) {
+            diverged = true;
+            break;
+        }
+
+        if (case_input.cfl_mode == CflMode::Ramp) {
+            cfl_residual_history.push_back(r.rho);
+            if (static_cast<int>(cfl_residual_history.size()) > case_input.cfl_ramp.window) {
+                cfl_residual_history.erase(cfl_residual_history.begin());
+            }
+            current_cfl = next_cfl(current_cfl, case_input.cfl, cfl_residual_history, case_input.cfl_ramp);
+            solver.set_cfl(current_cfl);
+        }
+
+        if (tracking_residual && step_index % case_input.residual_interval == 0) {
+            residual_out << step_index << "," << r.rho << "," << r.rho_u << ","
+                         << r.rho_v << "," << r.E << "," << kr << "," << wr << "\n";
+            residual_out.flush();
+        }
+        if (tracking_wall_forces && step_index % case_input.wall_forces_interval == 0) {
+            std::vector<WallFaceSample> samples = solver.compute_wall_traction_samples(wall_faces);
+            std::vector<WallForceReport> reports = compute_wall_forces(mesh, samples, wall_ref);
+            write_wall_forces_rows(wall_forces_out, step_index, mesh, reports);
+            wall_forces_out.flush();
+        }
+        if (tracking_wall_profile && case_input.wall_profile_interval > 0 &&
+            step_index % case_input.wall_profile_interval == 0) {
+            write_wall_profile_snapshot(numbered_filename(case_input.wall_profile_file, (int)step_index),
+                                          case_input.output_precision, mesh, compute_wall_node_snapshot());
+        }
+        if (case_input.write_interval > 0 && step_index % case_input.write_interval == 0) {
+            write_ransSST_fields(numbered_filename(case_input.output_file, step_index), mesh, solver.field(),
+                                  solver.k_field(), solver.omega_field(), case_input.gamma, case_input.gas_constant,
+                                  case_input.mu, case_input.sst_limiter_variant, case_input.sst_constants,
+                                  wall_distance_for_output, case_input.gradient_scheme, case_input.output_precision);
+        }
+
+        if (checking_convergence) {
+            bool rho_ok = !check_rho || r.rho < case_input.residual_tolerance_rho;
+            bool rho_u_ok = !check_rho_u || r.rho_u < case_input.residual_tolerance_rho_u;
+            bool rho_v_ok = !check_rho_v || r.rho_v < case_input.residual_tolerance_rho_v;
+            bool E_ok = !check_E || r.E < case_input.residual_tolerance_E;
+            bool k_ok = !check_k || kr < case_input.residual_tolerance_k;
+            bool omega_ok = !check_omega || wr < case_input.residual_tolerance_omega;
+            converged = rho_ok && rho_u_ok && rho_v_ok && E_ok && k_ok && omega_ok;
+        }
+        if (g_interrupt_requested) {
+            interrupted = true;
+        }
+        if (converged || interrupted) {
+            break;
+        }
+    }
+
+    if (diverged) {
+        std::cerr << "Error: solver diverged (NaN/Inf residual) at step " << last_completed_step << "\n";
+        write_ransSST_fields(case_input.output_file, mesh, solver.field(), solver.k_field(), solver.omega_field(),
+                             case_input.gamma, case_input.gas_constant, case_input.mu, case_input.sst_limiter_variant,
+                             case_input.sst_constants, wall_distance_for_output, case_input.gradient_scheme,
+                             case_input.output_precision);
+        if (tracking_wall_profile) {
+            write_wall_profile_snapshot(case_input.wall_profile_file, case_input.output_precision, mesh,
+                                          compute_wall_node_snapshot());
+        }
+        return false;
+    }
+
+    if (converged) {
+        std::cerr << "Residual converged at step " << last_completed_step << "\n";
+    } else if (interrupted) {
+        std::cerr << "Interrupted by user at step " << last_completed_step << "\n";
+    } else {
+        std::cout << "Simulation completed across " << last_completed_step << " steps.\n";
+    }
+
+    bool ran_any_step = last_completed_step >= resume_start;
+    if (checkpointing && ran_any_step) {
+        if (!Checkpoint::write(case_input.checkpoint_file, CheckpointEquation::RANS_SST, last_completed_step,
+                                FV_BUILD_NUMBER, solver.field(), solver.k_field(), solver.omega_field())) {
+            std::cerr << "Warning: failed to write checkpoint file '" << case_input.checkpoint_file << "'\n";
+        }
+    }
+
+    if (!write_ransSST_fields(case_input.output_file, mesh, solver.field(), solver.k_field(), solver.omega_field(),
+                              case_input.gamma, case_input.gas_constant, case_input.mu,
+                              case_input.sst_limiter_variant, case_input.sst_constants, wall_distance_for_output,
+                              case_input.gradient_scheme, case_input.output_precision)) {
         std::cerr << "Failed to write output file: " << case_input.output_file << "\n";
         return false;
     }
@@ -2761,6 +4383,10 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 //          or "--verify-couette" to check NavierStokesFVMSolver's steady
 //          shear profile against the analytic planar Couette flow solution
 //          (see run_verify_couette());
+//          or "--verify-cfl-ramp" to check CflRamp.h's next_cfl(), both as a
+//          standalone pure function against synthetic residual sequences and
+//          end-to-end (ramp mode converges to the same Couette-flow steady
+//          solution as a fixed-cfl run) -- see run_verify_cfl_ramp();
 //          or "--verify-wall-distance" to check compute_wall_distance()
 //          against an exact analytic flat-wall distance (see
 //          run_verify_wall_distance());
@@ -2778,14 +4404,29 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 //          or "--verify-sa-source" to check compute_sa_source_terms() in
 //          isolation against a zero-vorticity fixed point and a manufactured
 //          smooth field (see run_verify_sa_source_terms());
-//          or "--verify-rans-stability" to check RANSFVMSolver runs stably
+//          or "--verify-sst-source" to check compute_sst_source_terms() in
+//          isolation against a zero-k/omega fixed point, exact strain-rate/
+//          vorticity values, F1/F2's near-wall/far-field asymptotic limits,
+//          and self-consistent production/destruction/cross-diffusion terms
+//          on a manufactured smooth field, for both SSTLimiterVariant options
+//          (see run_verify_sst_source_terms());
+//          or "--verify-sst-stability" to check RANSTurbulenceSSTSolver runs
+//          stably (no divergence, residuals settle) on the same simple
+//          sheared/turbulent Couette setup as --verify-rans-stability, for
+//          both SSTLimiterVariant options, plus a third scenario exercising a
+//          live Farfield k/omega boundary (see run_verify_sst_stability());
+//          or "--verify-rans-stability" to check RANSTurbulenceSASolver runs stably
 //          (no divergence, residuals settle) on a simple sheared/turbulent
 //          setup (see run_verify_rans_stability());
-//          or "--verify-flat-plate" to check RANSFVMSolver's flat-plate
+//          or "--verify-flat-plate" to check RANSTurbulenceSASolver's flat-plate
 //          case against a laminar reference profile at a tractable
 //          (sub-transition) Reynolds number -- see
 //          run_verify_flat_plate_boundary_layer() for why this isn't the
 //          turbulent log-law Phase 4 originally set out to reach
+//          or "--verify-sst-flat-plate" for RANSTurbulenceSSTSolver's identical
+//          flat-plate setup, monitoring nu_t/nu's own trend during the run to
+//          decide between the same laminar target or the originally-intended
+//          turbulent log-law (see run_verify_sst_flat_plate())
 // Output:  writes the result to the .vtk path given by the case file's
 //          output_file key (and its checkpoint_file/residual_file, if set);
 //          diagnostics/errors go to stderr
@@ -2794,7 +4435,15 @@ bool run_rans(const CaseInput& case_input, const UnstructuredMesh& mesh) {
 //          succeeded, or one of the --verify-* checks passed; 1 if the case
 //          file, mesh file, or output file could not be loaded/written, the
 //          run diverged, or one of the --verify-* checks failed
-int main(int argc, char** argv) {
+//
+// Named run_main rather than main itself so that main() (below) can wrap the
+// whole thing in a try/catch: this project's dominant error-handling style
+// is "return false + print to stderr", not exceptions (see CaseInput/
+// MeshReader), but a handful of call sites still use std::vector::at() or
+// std::stod/stoi in a few places outside CaseInput's own guarded parsing --
+// this is a backstop against those, not a substitute for the specific
+// diagnostics above.
+int run_main(int argc, char** argv) {
 #ifdef _WIN32
     // Force this process's console output to UTF-8, regardless of the
     // codepage the console session started in, so accented characters
@@ -2827,6 +4476,10 @@ int main(int argc, char** argv) {
         return run_verify_couette() ? 0 : 1;
     }
 
+    if (argc >= 2 && std::string(argv[1]) == "--verify-cfl-ramp") {
+        return run_verify_cfl_ramp() ? 0 : 1;
+    }
+
     if (argc >= 2 && std::string(argv[1]) == "--verify-ns-stretched-cfl") {
         return run_verify_ns_stretched_cfl() ? 0 : 1;
     }
@@ -2851,12 +4504,24 @@ int main(int argc, char** argv) {
         return run_verify_sa_source_terms() ? 0 : 1;
     }
 
+    if (argc >= 2 && std::string(argv[1]) == "--verify-sst-source") {
+        return run_verify_sst_source_terms() ? 0 : 1;
+    }
+
+    if (argc >= 2 && std::string(argv[1]) == "--verify-sst-stability") {
+        return run_verify_sst_stability() ? 0 : 1;
+    }
+
     if (argc >= 2 && std::string(argv[1]) == "--verify-rans-stability") {
         return run_verify_rans_stability() ? 0 : 1;
     }
 
     if (argc >= 2 && std::string(argv[1]) == "--verify-flat-plate") {
         return run_verify_flat_plate_boundary_layer() ? 0 : 1;
+    }
+
+    if (argc >= 2 && std::string(argv[1]) == "--verify-sst-flat-plate") {
+        return run_verify_sst_flat_plate() ? 0 : 1;
     }
 
     if (argc >= 2 && std::string(argv[1]) == "--validate-mesh") {
@@ -2867,7 +4532,6 @@ int main(int argc, char** argv) {
 
         UnstructuredMesh mesh;
         if (!MeshReader::read(argv[2], mesh)) {
-            std::cerr << "Failed to load mesh file: " << argv[2] << "\n";
             return 1;
         }
 
@@ -2898,7 +4562,6 @@ int main(int argc, char** argv) {
 
     CaseInput case_input;
     if (!case_input.load(argv[1])) {
-        std::cerr << "Failed to load case file: " << argv[1] << "\n";
         return 1;
     }
 
@@ -2919,7 +4582,6 @@ int main(int argc, char** argv) {
 
     UnstructuredMesh mesh;
     if (!MeshReader::read(case_input.mesh_file, mesh)) {
-        std::cerr << "Failed to load mesh file: " << case_input.mesh_file << "\n";
         return 1;
     }
     // Every solver constructor computes face geometry (x_mid/y_mid/area/nx/ny)
@@ -2939,8 +4601,10 @@ int main(int argc, char** argv) {
         ok = run_advection_diffusion(case_input, mesh);
     } else if (case_input.equation == EquationSet::NavierStokes) {
         ok = run_navier_stokes(case_input, mesh);
-    } else if (case_input.equation == EquationSet::RANS) {
-        ok = run_rans(case_input, mesh);
+    } else if (case_input.equation == EquationSet::RANS_SA) {
+        ok = run_ransSA(case_input, mesh);
+    } else if (case_input.equation == EquationSet::RANS_SST) {
+        ok = run_ransSST(case_input, mesh);
     } else {
         ok = run_euler(case_input, mesh);
     }
@@ -2951,4 +4615,18 @@ int main(int argc, char** argv) {
 
     std::cout << "Results written to " << case_input.output_file << "\n";
     return 0;
+}
+
+// Thin wrapper around run_main(): catches any std::exception that escapes it
+// (an uncaught exception otherwise crashes with an unhandled-exception
+// message rather than a clean diagnostic) and reports it the same way every
+// other failure in this program is reported -- a message to stderr and a
+// non-zero exit code -- rather than a raw crash.
+int main(int argc, char** argv) {
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << "\n";
+        return 1;
+    }
 }

@@ -154,6 +154,11 @@ public:
         last_residual = EulerResidualNorms{};
     }
 
+    // Overwrites the CFL number compute_dt() uses on the next step() call --
+    // e.g. for residual-based CFL ramping (see CflRamp.h/main.cpp's cfl_mode
+    // handling). Takes effect starting with the next step(), not retroactively.
+    void set_cfl(double new_cfl) { cfl = new_cfl; }
+
 private:
     UnstructuredMesh mesh;
     std::vector<EulerState> U;                  // Conserved state field: one entry per mesh.cells

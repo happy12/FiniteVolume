@@ -30,7 +30,10 @@ namespace MeshReader {
     // Returns:
     //   true on success; false if the file could not be opened, uses an
     //   unsupported format version/feature (e.g. binary, parametric node
-    //   coordinates), or contains no nodes/cells.
+    //   coordinates), contains no nodes/cells, has an untagged boundary edge,
+    //   or fails the post-build geometry validation (non-finite node
+    //   coordinate, or a degenerate zero/non-finite cell volume or face
+    //   length -- see validate_mesh_geometry() in MeshReader.cpp).
     bool read_gmsh(const std::string& filename, UnstructuredMesh& mesh);
 
     // Reads this project's own FVMESH format (see docs/fvmesh-format.md) into
@@ -48,10 +51,12 @@ namespace MeshReader {
     //              normal still require a separate compute_geometry() call)
     // Returns:
     //   true on success; false if the file could not be opened, its header
-    //   is missing/malformed/an unsupported version, or a CELLS/BOUNDARY
-    //   entry references an out-of-range node index. A BOUNDARY edge that
-    //   matches no cell edge is
-    //   silently ignored (same behavior as read_gmsh's boundary line elements).
+    //   is missing/malformed/an unsupported version, a CELLS/BOUNDARY entry
+    //   references an out-of-range node index, has an untagged boundary edge,
+    //   or fails the post-build geometry validation (same checks as
+    //   read_gmsh -- see validate_mesh_geometry() in MeshReader.cpp). A
+    //   BOUNDARY edge that matches no cell edge is silently ignored (same
+    //   behavior as read_gmsh's boundary line elements).
     bool read_fvmesh(const std::string& filename, UnstructuredMesh& mesh);
 
     // Dispatches to read_gmsh or read_fvmesh based on 'filename's extension

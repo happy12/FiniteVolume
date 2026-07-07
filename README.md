@@ -1,12 +1,14 @@
 # FiniteVolume
 
+![NACA0012 at Mach 0.1](naca0012.png)
+
 A C++ standalone 2D unstructured finite-volume solver, with no external library
 dependencies. Solves scalar diffusion, advection-diffusion of a passive
 scalar, the compressible Euler equations, the compressible (laminar)
 Navier-Stokes equations, or the Navier-Stokes equations closed with a
-Spalart-Allmaras RANS turbulence model, on an arbitrary polygon mesh (cells
-may have any number of faces), driven by a plain-text case file, and writes
-results as legacy VTK files.
+Spalart-Allmaras or k-omega SST RANS turbulence model, on an arbitrary
+polygon mesh (cells may have any number of faces), driven by a plain-text
+case file, and writes results as legacy VTK files.
 
 ## Build
 

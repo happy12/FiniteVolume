@@ -7,7 +7,7 @@
 // SA-noft2 model constants (no trip term ft2, fully-turbulent flow assumed
 // everywhere -- the architecture decision in
 // docs/archive/rans-spalart-allmaras-tracker.md), collected into a struct
-// (rather than fixed constexpr globals) so a caller (e.g. RANSFVMSolver, via
+// (rather than fixed constexpr globals) so a caller (e.g. RANSTurbulenceSASolver, via
 // a case-file override) can substitute non-default values -- cw1 is left out
 // since it's derived from cb1/kappa/sigma, not independent; see cw1() below.
 struct SAModelConstants {
@@ -18,7 +18,7 @@ struct SAModelConstants {
     double cw2 = 0.3;
     double cw3 = 2.0;
     double cv1 = 7.1;
-    double cv2 = 0.7; // negative-S~ robustness fix (Spalart & Allmaras 1994) -- see compute_sa_source_terms()
+    double cv2 = 0.7; // negative-S~ robustness fix (Allmaras, Johnson & Spalart 2012, ICCFD7-1902) -- see compute_sa_source_terms()
     double cv3 = 0.9;
 };
 
@@ -61,10 +61,10 @@ double sa_eddy_viscosity(double nut, double nu, const SAModelConstants& c = SAMo
 // Computes this cell's production/destruction/cross-diffusion source terms.
 //
 // Methodology (SA-noft2, standard form, with the standard negative-S~
-// robustness fix -- Spalart & Allmaras 1994; added in Phase 3 of
-// docs/archive/rans-spalart-allmaras-tracker.md after a real coupled RANSFVMSolver
-// run hit exactly the failure mode this fix exists for -- see that phase's
-// notes):
+// robustness fix -- Allmaras, Johnson & Spalart 2012, ICCFD7-1902; added in
+// Phase 3 of docs/archive/rans-spalart-allmaras-tracker.md after a real
+// coupled RANSTurbulenceSASolver run hit exactly the failure mode this fix exists
+// for -- see that phase's notes):
 //   chi   = nut / nu (0 if nut <= 0)
 //   fv1   = chi^3 / (chi^3 + Cv1^3)
 //   fv2   = 1 - chi / (1 + chi*fv1)

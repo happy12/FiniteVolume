@@ -241,8 +241,10 @@ pass on all five pre-existing `--verify-*` flags confirmed unaffected.
   restrictive side for the molecular term).
 - [include/SpalartAllmaras.h](../../include/SpalartAllmaras.h) /
   [src/SpalartAllmaras.cpp](../../src/SpalartAllmaras.cpp) gained the standard
-  negative-`S~` robustness fix (Spalart & Allmaras 1994: `SA_CV2 = 0.7`,
-  `SA_CV3 = 0.9`) -- added mid-phase after a real coupled run hit exactly the
+  negative-`S~` robustness fix (Allmaras, Johnson & Spalart 2012, ICCFD7-1902:
+  `SA_CV2 = 0.7`, `SA_CV3 = 0.9` -- misattributed to "Spalart & Allmaras 1994"
+  in this doc until corrected via docs/references.md's research) -- added
+  mid-phase after a real coupled run hit exactly the
   failure mode this fix exists for (see "What went wrong" below). This
   expands the constant set beyond what Phase 2's architecture decision
   originally fixed; re-confirmed with Mathieu before adding it, rather than

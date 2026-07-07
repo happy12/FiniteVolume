@@ -8,6 +8,7 @@
 #include <utility>
 #include <algorithm>
 #include <iostream>
+#include <cmath>
 
 namespace {
 
@@ -74,6 +75,118 @@ void compute_cell_geometry(UnstructuredMesh& mesh, int cell_index) {
     cell.y_centroid = cy;
 }
 
+// Validates basic mesh geometry once nodes/cells/faces are built, catching
+// the failure mode CLAUDE.md documents as a known gap: a degenerate mesh
+// (collinear/coincident cell vertices, a zero-length face) otherwise loads
+// without complaint and only surfaces later as a silent NaN/Inf once
+// UnstructuredMesh::compute_geometry() divides a zero face length into its
+// normal, or a solver divides by a zero cell volume. Only exactly-degenerate
+// (zero or non-finite) geometry is a hard error; a merely very small nonzero
+// face/cell is reported as a warning, since a legitimately stretched
+// boundary-layer mesh can have very thin cells without being invalid (see
+// --verify-ns-stretched-cfl).
+//
+// Input:  mesh - nodes/cells/faces must already be populated (cell volumes
+//         via compute_cell_geometry above; face.area/nx/ny are NOT yet
+//         populated at this point in the pipeline -- see
+//         UnstructuredMesh::compute_geometry -- so face length is computed
+//         fresh here from node coordinates instead of relying on that field)
+// Output: none (mesh unmodified); diagnostics printed to stderr
+// Returns: true if no hard error was found (warnings do not fail the load); false otherwise
+bool validate_mesh_geometry(const UnstructuredMesh& mesh) {
+    bool ok = true;
+
+    for (size_t i = 0; i < mesh.nodes.size(); ++i) {
+        const Node& n = mesh.nodes[i];
+        if (!std::isfinite(n.x) || !std::isfinite(n.y)) {
+            std::cerr << "Error: mesh node " << i << " has a non-finite coordinate ("
+                       << n.x << ", " << n.y << ")\n";
+            ok = false;
+        }
+    }
+    if (!ok) return false; // cell/face geometry below is meaningless with garbage coordinates
+
+    // Exact-duplicate node positions (distinct indices, identical
+    // coordinates) aren't fatal by themselves, but usually indicate a
+    // mesh-generation mistake worth flagging.
+    std::vector<int> order(mesh.nodes.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (mesh.nodes[a].x != mesh.nodes[b].x) return mesh.nodes[a].x < mesh.nodes[b].x;
+        return mesh.nodes[a].y < mesh.nodes[b].y;
+    });
+    for (size_t i = 1; i < order.size(); ++i) {
+        const Node& a = mesh.nodes[order[i - 1]];
+        const Node& b = mesh.nodes[order[i]];
+        if (a.x == b.x && a.y == b.y) {
+            std::cerr << "Warning: mesh nodes " << order[i - 1] << " and " << order[i]
+                       << " are at the same coordinate (" << a.x << ", " << a.y << ")\n";
+        }
+    }
+
+    // Cell volumes: exactly zero/non-finite (a fully collinear/collapsed
+    // polygon) is a hard error; merely very small relative to the mesh's own
+    // mean cell volume is only a warning.
+    double volume_sum = 0.0;
+    int finite_volume_count = 0;
+    for (const Cell& cell : mesh.cells) {
+        if (std::isfinite(cell.volume) && cell.volume > 0.0) {
+            volume_sum += cell.volume;
+            ++finite_volume_count;
+        }
+    }
+    double mean_volume = (finite_volume_count > 0) ? volume_sum / finite_volume_count : 0.0;
+
+    for (size_t c = 0; c < mesh.cells.size(); ++c) {
+        double volume = mesh.cells[c].volume;
+        if (!std::isfinite(volume) || volume <= 0.0) {
+            std::cerr << "Error: cell " << c << " has a degenerate (zero or non-finite) volume ("
+                       << volume << ") -- its polygon vertices are collinear or coincident\n";
+            ok = false;
+        } else if (mean_volume > 0.0 && volume < 1e-8 * mean_volume) {
+            std::cerr << "Warning: cell " << c << " has volume " << volume
+                       << ", far smaller than the mesh's mean cell volume (" << mean_volume
+                       << ") -- check for a near-degenerate element\n";
+        }
+    }
+
+    // Face lengths: exactly zero/non-finite (coincident endpoints) is a hard
+    // error -- it would otherwise divide by zero in compute_geometry()'s
+    // normal calculation; merely very small is only a warning.
+    std::vector<double> lengths(mesh.faces.size());
+    double length_sum = 0.0;
+    int finite_length_count = 0;
+    for (size_t f = 0; f < mesh.faces.size(); ++f) {
+        const Face& face = mesh.faces[f];
+        double dx = mesh.nodes[face.node2].x - mesh.nodes[face.node1].x;
+        double dy = mesh.nodes[face.node2].y - mesh.nodes[face.node1].y;
+        double length = std::sqrt(dx * dx + dy * dy);
+        lengths[f] = length;
+        if (std::isfinite(length) && length > 0.0) {
+            length_sum += length;
+            ++finite_length_count;
+        }
+    }
+    double mean_length = (finite_length_count > 0) ? length_sum / finite_length_count : 0.0;
+
+    for (size_t f = 0; f < mesh.faces.size(); ++f) {
+        double length = lengths[f];
+        if (!std::isfinite(length) || length <= 0.0) {
+            std::cerr << "Error: face " << f << " (nodes " << mesh.faces[f].node1 << ", "
+                       << mesh.faces[f].node2 << ") has a degenerate (zero or non-finite) length ("
+                       << length << ")\n";
+            ok = false;
+        } else if (mean_length > 0.0 && length < 1e-8 * mean_length) {
+            std::cerr << "Warning: face " << f << " (nodes " << mesh.faces[f].node1 << ", "
+                       << mesh.faces[f].node2 << ") has length " << length
+                       << ", far smaller than the mesh's mean face length (" << mean_length
+                       << ") -- check for a near-degenerate element\n";
+        }
+    }
+
+    return ok;
+}
+
 // Builds mesh.cells/mesh.faces/mesh.patches from the raw elements collected
 // by either format's section parser. Shared so that the 2.2 and 4.1 readers
 // (which differ only in how they populate 'cell_elements'/'line_elements'/
@@ -91,7 +204,10 @@ void compute_cell_geometry(UnstructuredMesh& mesh, int cell_index) {
 //         line_elements   - 1D (line) elements tagging boundary edges
 //         physical_names  - physical group id -> name, for patches
 // Output: mesh.cells/faces/patches are filled in
-// Returns: true (always succeeds once called)
+// Returns: false if any boundary face is untagged or validate_mesh_geometry()
+//          finds a degenerate (zero/non-finite volume or face length) element
+//          (a descriptive message is printed to stderr in either case);
+//          true otherwise
 bool build_cells_faces_patches(UnstructuredMesh& mesh,
                                 const std::vector<TempElement>& cell_elements,
                                 const std::vector<TempElement>& line_elements,
@@ -185,6 +301,10 @@ bool build_cells_faces_patches(UnstructuredMesh& mesh,
         std::cerr << "Error: mesh has " << untagged_count << " boundary faces with no assigned "
                      "patch (untagged boundary edges). Every boundary face must belong to a "
                      "tagged patch.\n";
+        return false;
+    }
+
+    if (!validate_mesh_geometry(mesh)) {
         return false;
     }
 
@@ -290,6 +410,7 @@ bool read_gmsh_v22(std::ifstream& in, UnstructuredMesh& mesh) {
     }
 
     if (mesh.nodes.empty() || cell_elements.empty()) {
+        std::cerr << "Error reading mesh: no nodes or cells were found in the $Nodes/$Elements sections\n";
         return false;
     }
 
@@ -476,6 +597,7 @@ bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh) {
     }
 
     if (mesh.nodes.empty() || cell_elements.empty()) {
+        std::cerr << "Error reading mesh: no nodes or cells were found in the $Nodes/$Elements sections\n";
         return false;
     }
 
@@ -505,6 +627,7 @@ bool read_gmsh_v41(std::ifstream& in, UnstructuredMesh& mesh) {
 bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh) {
     std::ifstream in(filename);
     if (!in.is_open()) {
+        std::cerr << "Error: could not open mesh file '" << filename << "'\n";
         return false;
     }
 
@@ -530,7 +653,7 @@ bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh) 
         return read_gmsh_v41(in, mesh);
     }
 
-    std::cerr << "Failed to read mesh file '" << filename << "': unsupported Gmsh format version "
+    std::cerr << "Error in mesh file '" << filename << "': unsupported Gmsh format version "
                << version << " (supported: 2.2, 4.x ASCII)\n";
     return false;
 }
@@ -545,11 +668,13 @@ bool MeshReader::read_gmsh(const std::string& filename, UnstructuredMesh& mesh) 
 bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh) {
     std::ifstream in(filename);
     if (!in.is_open()) {
+        std::cerr << "Error: could not open mesh file '" << filename << "'\n";
         return false;
     }
 
     std::string header;
     if (!std::getline(in, header)) {
+        std::cerr << "Error in mesh file '" << filename << "': file is empty (missing '# FVMESH <major>.<minor>' header)\n";
         return false;
     }
     if (!header.empty() && header.back() == '\r') header.pop_back();
@@ -573,7 +698,7 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
     }
 
     if (major != 1 || minor != 0) {
-        std::cerr << "Failed to read mesh file '" << filename << "': unsupported FVMESH version '"
+        std::cerr << "Error in mesh file '" << filename << "': unsupported FVMESH version '"
                    << version_token << "' (supported: 1.0)\n";
         return false;
     }
@@ -617,7 +742,7 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
                     int idx;
                     in >> idx;
                     if (idx < 0 || (size_t)idx >= mesh.nodes.size()) {
-                        std::cerr << "Failed to read mesh file '" << filename
+                        std::cerr << "Error in mesh file '" << filename
                                   << "': CELLS entry references out-of-range node index " << idx << "\n";
                         return false;
                     }
@@ -634,7 +759,7 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
                 std::string patch_name;
                 in >> a >> b >> patch_name;
                 if (a < 0 || (size_t)a >= mesh.nodes.size() || b < 0 || (size_t)b >= mesh.nodes.size()) {
-                    std::cerr << "Failed to read mesh file '" << filename
+                    std::cerr << "Error in mesh file '" << filename
                               << "': BOUNDARY entry references out-of-range node index\n";
                     return false;
                 }
@@ -657,12 +782,13 @@ bool MeshReader::read_fvmesh(const std::string& filename, UnstructuredMesh& mesh
             }
             std::getline(in, line); // consume rest of the last boundary line
         } else {
-            std::cerr << "Failed to read mesh file '" << filename << "': unrecognized section '" << tag << "'\n";
+            std::cerr << "Error in mesh file '" << filename << "': unrecognized section '" << tag << "'\n";
             return false;
         }
     }
 
     if (mesh.nodes.empty() || cell_elements.empty()) {
+        std::cerr << "Error in mesh file '" << filename << "': no POINTS or CELLS sections found\n";
         return false;
     }
 
@@ -685,7 +811,7 @@ bool MeshReader::read(const std::string& filename, UnstructuredMesh& mesh) {
         return read_fvmesh(filename, mesh);
     }
 
-    std::cerr << "Failed to read mesh file '" << filename
+    std::cerr << "Error in mesh file '" << filename
               << "': unrecognized extension (expected .msh or .fvmesh)\n";
     return false;
 }

@@ -2,12 +2,12 @@
 #define FV_VERSION_H_INCLUDED
 
 #define FV_VERSION_MAJOR 0
-#define FV_VERSION_MINOR 2
+#define FV_VERSION_MINOR 3
 #define FV_BUILD_NUMBER  @BUILD_NUMBER@
 #define FV_BUILD_NUMBER_STR "@BUILD_NUMBER@"
 
-#define FV_VERSION_STRING "0.2." FV_BUILD_NUMBER_STR
-#define FV_VERSION_FULL   "0.2." FV_BUILD_NUMBER_STR
+#define FV_VERSION_STRING "0.3." FV_BUILD_NUMBER_STR
+#define FV_VERSION_FULL   "0.3." FV_BUILD_NUMBER_STR
 
 // Narrow (UTF-8) forms, for use in C++ console output (--version).
 #define FV_PUBLISHER      "Mathieu Frégeau"

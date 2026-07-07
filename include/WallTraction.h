@@ -20,12 +20,12 @@ enum class BoundaryLayerMethod {
 // boundary-layer thickness) as a separate, on-demand post-processing pass
 // over only a mesh's NoSlipWall boundary faces -- see
 // docs/wall-diagnostics-plan.md for the full design discussion. Kept
-// solver-agnostic (no dependency on NavierStokesFVMSolver/RANSFVMSolver),
+// solver-agnostic (no dependency on NavierStokesFVMSolver/RANSTurbulenceSASolver),
 // same reasoning as WallDistance.h: it depends only on mesh geometry, a wall
 // face list, and flow-field snapshots handed in by whichever solver owns
 // them, not on which solver produced those fields. 'effective_viscosity' is
 // per-cell so a caller can pass mu (NavierStokesFVMSolver) or mu + rho*nu_t
-// (RANSFVMSolver) without this module needing to know which.
+// (RANSTurbulenceSASolver) without this module needing to know which.
 
 // One wall-tangential traction sample at a single NoSlipWall boundary face.
 // Deliberately reference-agnostic (no rho_ref/V_ref/p_ref baked in) --
@@ -50,7 +50,7 @@ struct WallFaceSample {
 //
 // Methodology: reuses face_gradient() and corrected_face_gradient_vector()
 // (GradientReconstruction.h) to get the full 2D gradient vector of u and v at
-// each wall face exactly as NavierStokesFVMSolver::step()/RANSFVMSolver::step()
+// each wall face exactly as NavierStokesFVMSolver::step()/RANSTurbulenceSASolver::step()
 // do for their own viscous flux, then assembles the same Newtonian stress
 // tensor (tau_xx, tau_yy, tau_xy) and projects it onto the face's outward
 // normal to get the traction vector, and onto the tangent direction

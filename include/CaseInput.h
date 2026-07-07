@@ -6,9 +6,12 @@
 #include <vector>
 
 #include "UnstructuredMesh.h"
+#include "CflRamp.h"
 #include "EulerFVMSolver.h"
 #include "NavierStokesFVMSolver.h"
-#include "RANSFVMSolver.h"
+#include "RANSTurbulenceSASolver.h"
+#include "RANSTurbulenceSSTSolver.h"
+#include "SSTKOmega.h"
 #include "GradientReconstruction.h"
 
 // A boundary condition assignment read from the case file, matched by patch
@@ -55,11 +58,11 @@ struct NSBoundaryConditionSpec {
 // 'equation' is RANS. Distinct from NSBoundaryConditionSpec (even though a
 // no-slip wall/farfield/outflow mean exactly the same thing for the mean-flow
 // equations here as they do for Navier-Stokes) purely so a case file's
-// rans_* boundary keywords land in their own vector -- see
-// RANSBoundaryCondition in RANSFVMSolver.h -- and to carry the one extra
+// ransSA_* boundary keywords land in their own vector -- see
+// RANSBoundaryConditionSA in RANSTurbulenceSASolver.h -- and to carry the one extra
 // value RANS's nut transport equation needs beyond that: a prescribed
 // freestream nut for a Farfield boundary.
-struct RANSBoundaryConditionSpec {
+struct RANSBoundaryConditionSpecSA {
     std::string patch_name;
     NSBoundaryType type;
     double wall_u = 0.0, wall_v = 0.0; // NoSlipWall only; the wall's own velocity (0,0 = stationary)
@@ -69,7 +72,26 @@ struct RANSBoundaryConditionSpec {
     // mesh-consistent units -- see EulerState.h); only meaningful when
     // type == Farfield.
     double rho = 0.0, u = 0.0, v = 0.0, p = 0.0;
-    double farfield_nut = 0.0; // only meaningful when type == Farfield; see RANSBoundaryCondition::farfield_nut
+    double farfield_nut = 0.0; // only meaningful when type == Farfield; see RANSBoundaryConditionSA::farfield_nut
+};
+
+// A boundary condition assignment read from the case file, matched by patch
+// name against the boundary patches parsed from the mesh file. Used when
+// 'equation' is RANS_SST. Same rationale as RANSBoundaryConditionSpecSA
+// (its own vector, so ransSST_* keywords don't collide with ransSA_*'s), and
+// carries the two extra values the k/omega transport equations need at a
+// Farfield boundary -- see RANSBoundaryConditionSST in RANSTurbulenceSSTSolver.h.
+struct RANSBoundaryConditionSpecSST {
+    std::string patch_name;
+    NSBoundaryType type;
+    double wall_u = 0.0, wall_v = 0.0; // NoSlipWall only; the wall's own velocity (0,0 = stationary)
+    bool is_isothermal_wall = false; // NoSlipWall only; false = adiabatic (zero heat flux)
+    double wall_temperature = 0.0;   // NoSlipWall + is_isothermal_wall only
+    // Prescribed primitive state (density, velocity components, pressure, in
+    // mesh-consistent units -- see EulerState.h); only meaningful when
+    // type == Farfield.
+    double rho = 0.0, u = 0.0, v = 0.0, p = 0.0;
+    double farfield_k = 0.0, farfield_omega = 0.0; // only meaningful when type == Farfield; see RANSBoundaryConditionSST
 };
 
 // Which physics 'equation' selects.
@@ -78,7 +100,8 @@ enum class EquationSet {
     Euler,
     AdvectionDiffusion,
     NavierStokes,
-    RANS
+    RANS_SA,
+    RANS_SST
 };
 
 // Parses a simple key=value case file describing solver run parameters,
@@ -107,6 +130,24 @@ enum class EquationSet {
 //   equation = euler
 //   gamma = 1.4
 //   cfl = 0.5
+//   cfl_mode = fixed               (or 'ramp'; default 'fixed', today's behavior
+//                                    unchanged. Also applies to navier_stokes/
+//                                    rans_sa/rans_sst below -- ignored for
+//                                    diffusion/advection_diffusion, which use
+//                                    dt/alpha directly. See docs/adaptive-cfl-
+//                                    ramp-plan.md and CflRamp.h/next_cfl() for
+//                                    the ramp rule. In 'ramp' mode, 'cfl' above
+//                                    is the ceiling the ramp grows *toward*,
+//                                    not a fixed value used from step 1.)
+//   cfl_min = 0.05                 (ramp only: starting/floor CFL)
+//   cfl_ramp_growth = 1.5          (ramp only: multiplier applied when the
+//                                    monitored residual's windowed trend is decreasing)
+//   cfl_ramp_shrink = 0.5          (ramp only: multiplier applied when the
+//                                    trend is mildly rising)
+//   cfl_ramp_window = 15           (ramp only: number of steps of residual
+//                                    history the trend is computed over)
+//   cfl_ramp_divergence_threshold = 2.0  (ramp only: log10(residual) rise over
+//                                    the window that forces a hard reset to cfl_min)
 //   flux_scheme = rusanov      (or 'hllc'/'exact'; omit for the default 'rusanov')
 //   exact_riemann_tol = 1e-6       (exact solver's Newton-Raphson tolerance; not meant to be tuned)
 //   exact_riemann_max_iter = 20    (exact solver's Newton-Raphson iteration cap; not meant to be tuned)
@@ -194,7 +235,7 @@ enum class EquationSet {
 //   boundary_layer_n_samples = 200   (point-location only; number of
 //                                    evenly-spaced sample points, default 200)
 //
-// or for the RANS (Spalart-Allmaras) equations (equation = rans) -- same
+// or for the RANS (Spalart-Allmaras) equations (equation = rans_sa) -- same
 // gamma/cfl/flux_scheme/exact_riemann_*/mu/prandtl/gas_constant/
 // gradient_scheme/nsteps keys as Navier-Stokes above (mu/prandtl/gas_constant
 // govern the mean-flow molecular terms exactly as they do for Navier-Stokes),
@@ -213,19 +254,73 @@ enum class EquationSet {
 //   sa_cv2 = 0.7
 //   sa_cv3 = 0.9
 //
-//   rans_init = freestream 1.0 0.0 0.0 1.0     (same grammar as ns_init, own storage)
-//   (or) rans_init = tworegion 1.0 0.0 0.0 1.0  0.125 0.0 0.0 0.1  0.0
+//   ransSA_init = freestream 1.0 0.0 0.0 1.0     (same grammar as ns_init, own storage)
+//   (or) ransSA_init = tworegion 1.0 0.0 0.0 1.0  0.125 0.0 0.0 0.1  0.0
 //
-//   boundary wall1 rans_wall                       (no-slip, stationary, adiabatic)
-//   boundary wall2 rans_wall_isothermal 1.0         (no-slip, stationary, fixed wall temperature)
-//   boundary wall3 rans_wall_moving 0.5 0.0         (no-slip, moving at (u,v)=(0.5,0), adiabatic)
-//   boundary wall4 rans_wall_moving_isothermal 0.5 0.0 1.0  (moving + fixed wall temperature)
-//   boundary inlet rans_farfield 1.0 2.0 0.0 1.0 3e-5   (rho u v p farfield_nut)
-//   boundary outlet rans_outflow
+//   boundary wall1 ransSA_wall                       (no-slip, stationary, adiabatic)
+//   boundary wall2 ransSA_wall_isothermal 1.0         (no-slip, stationary, fixed wall temperature)
+//   boundary wall3 ransSA_wall_moving 0.5 0.0         (no-slip, moving at (u,v)=(0.5,0), adiabatic)
+//   boundary wall4 ransSA_wall_moving_isothermal 0.5 0.0 1.0  (moving + fixed wall temperature)
+//   boundary inlet ransSA_farfield 1.0 2.0 0.0 1.0 3e-5   (rho u v p farfield_nut)
+//   boundary outlet ransSA_outflow
 //
 // wall_forces_file/wall_profile_file/reference_*/boundary_layer_* (see
 // Navier-Stokes above) all apply to RANS too, using mu + rho*nu_t as the
 // effective viscosity instead of just mu.
+//
+// or for the RANS (k-omega SST) equations (equation = rans_sst) -- same
+// gamma/cfl/flux_scheme/exact_riemann_*/mu/prandtl/gas_constant/
+// gradient_scheme/nsteps/prandtl_t keys as RANS (Spalart-Allmaras) above,
+// plus:
+//   initial_k = 1e-4                (uniform initial k applied to every cell,
+//                                    mesh-consistent units; default 0)
+//   initial_omega = 10.0             (uniform initial omega applied to every
+//                                    cell, mesh-consistent units; default 0)
+//   sst_turbulence_intensity = 0.05 (Tu, dimensionless; used to DERIVE
+//   sst_eddy_viscosity_ratio = 10.0   initial_k/initial_omega from the
+//                                    ransSST_init freestream velocity and
+//                                    mu/rho -- k = 1.5*(Tu*|U|)^2,
+//                                    omega = k/(ratio*nu) -- ONLY when
+//                                    initial_k/initial_omega are not set
+//                                    explicitly above; omitted entirely,
+//                                    both default to 0, same as SA's
+//                                    initial_nut having no derivation)
+//   sst_limiter = vorticity          (or 'strain_rate'; selects
+//                                    SSTLimiterVariant -- see SSTKOmega.h;
+//                                    default 'vorticity', the original 1994 SST)
+//   sst_kato_launder = false         (Kato-Launder production limiter, true/false; see
+//                                    SSTKOmega.h's compute_sst_source_terms(); default false)
+//   sst_beta_star = 0.09             (SST model constants -- see SSTKOmega.h;
+//   sst_kappa = 0.41                  each independently optional, defaults
+//   sst_a1 = 0.31                     to the NASA TMR set; exposed for
+//   sst_sigma_k1 = 0.85               experimentation, not meant to be tuned
+//   sst_sigma_k2 = 1.0                in normal use)
+//   sst_sigma_omega1 = 0.5
+//   sst_sigma_omega2 = 0.856
+//   sst_beta1 = 0.075
+//   sst_beta2 = 0.0828
+//
+//   ransSST_init = freestream 1.0 0.0 0.0 1.0     (same grammar as ransSA_init, own storage)
+//   (or) ransSST_init = tworegion 1.0 0.0 0.0 1.0  0.125 0.0 0.0 0.1  0.0
+//
+//   boundary wall1 ransSST_wall                       (no-slip, stationary, adiabatic)
+//   boundary wall2 ransSST_wall_isothermal 1.0         (no-slip, stationary, fixed wall temperature)
+//   boundary wall3 ransSST_wall_moving 0.5 0.0         (no-slip, moving at (u,v)=(0.5,0), adiabatic)
+//   boundary wall4 ransSST_wall_moving_isothermal 0.5 0.0 1.0  (moving + fixed wall temperature)
+//   boundary inlet ransSST_farfield 1.0 2.0 0.0 1.0 1e-4 10.0   (rho u v p farfield_k farfield_omega,
+//                                    explicit per-patch values -- NOT derived
+//                                    from sst_turbulence_intensity/
+//                                    sst_eddy_viscosity_ratio, unlike
+//                                    initial_k/initial_omega above)
+//   boundary outlet ransSST_outflow
+//
+// wall_forces_file/wall_profile_file/reference_*/boundary_layer_* (see
+// Navier-Stokes above) all apply to RANS (k-omega SST) too, using
+// mu + rho*nu_t as the effective viscosity instead of just mu, same as SA.
+//
+// residual_tolerance_k/residual_tolerance_omega (see the stopping-criteria
+// keys below) are this equation set's analogue of RANS (Spalart-Allmaras)'s
+// residual_tolerance_nut.
 //
 // All equation sets also accept optional monitoring keys:
 //   residual_file = output/residual.csv   (omit to disable residual tracking)
@@ -246,7 +341,9 @@ enum class EquationSet {
 //   residual_tolerance_rho_u = 1e-6        "converged" requires every tolerance the user set
 //   residual_tolerance_rho_v = 1e-6        to be satisfied simultaneously)
 //   residual_tolerance_E = 1e-6
-//   residual_tolerance_nut = 1e-6         (RANS only; checked alongside the four above)
+//   residual_tolerance_nut = 1e-6         (RANS (Spalart-Allmaras) only; checked alongside the four above)
+//   residual_tolerance_k = 1e-6           (RANS (k-omega SST) only; checked alongside the four above)
+//   residual_tolerance_omega = 1e-6       (RANS (k-omega SST) only; checked alongside the four above)
 //
 //   checkpoint_file = output/checkpoint.bin  (omit to disable checkpointing; written when
 //                                              the run stops for any reason except divergence;
@@ -276,9 +373,10 @@ public:
     //          in the file keep their default value)
     // Returns: true on success (file opened, mesh_file/output_file set,
     //          every boundary/equation/euler_init/ns_init keyword recognized,
-    //          and output_precision -- if set -- is within 1-17); false
-    //          otherwise (a descriptive message is printed to stderr on an
-    //          unrecognized keyword or an out-of-range output_precision).
+    //          every numeric "key = value" parsed as a number, and any value
+    //          with an obvious valid domain -- nsteps/dt/cfl/mu/gamma/
+    //          output_precision -- in range); false otherwise (a descriptive
+    //          message naming the file, line, and key is printed to stderr).
     bool load(const std::string& filename);
 
     std::string mesh_file;                 // Path to the mesh file to solve on: Gmsh ASCII (.msh) or
@@ -303,7 +401,9 @@ public:
     double residual_tolerance_rho_u = -1.0;
     double residual_tolerance_rho_v = -1.0;
     double residual_tolerance_E = -1.0;
-    double residual_tolerance_nut = -1.0;    // RANS only, checked alongside rho/rho_u/rho_v/E above
+    double residual_tolerance_nut = -1.0;    // RANS (Spalart-Allmaras) only, checked alongside rho/rho_u/rho_v/E above
+    double residual_tolerance_k = -1.0;      // RANS (k-omega SST) only, checked alongside rho/rho_u/rho_v/E above
+    double residual_tolerance_omega = -1.0;  // RANS (k-omega SST) only, checked alongside rho/rho_u/rho_v/E above
 
     // --- Checkpoint/restart (shared by both equation sets) ---
     std::string checkpoint_file;             // Path to save/resume solver state; empty = disabled
@@ -333,7 +433,13 @@ public:
 
     // --- Euler-only parameters ---
     double gamma = 1.4;                     // Ratio of specific heats, dimensionless (1.4 for air)
-    double cfl = 0.5;                       // CFL number, dimensionless, controlling the adaptive time step
+    double cfl = 0.5;                       // CFL number, dimensionless, controlling the adaptive time step;
+                                              // in cfl_mode == Ramp, the ceiling the ramp grows toward
+    CflMode cfl_mode = CflMode::Fixed;      // Fixed (unchanged behavior) or Ramp -- see CflRamp.h; also
+                                              // applies to navier_stokes/rans_sa/rans_sst below
+    CflRampParams cfl_ramp;                 // Ramp-only parameters (cfl_min/cfl_ramp_growth/cfl_ramp_shrink/
+                                              // cfl_ramp_window/cfl_ramp_divergence_threshold); ignored when
+                                              // cfl_mode == Fixed
     NumericalFluxScheme flux_scheme = NumericalFluxScheme::Rusanov; // Numerical flux used at every face (see EulerFVMSolver.h)
     // Exact Riemann solver's Newton-Raphson relative pressure tolerance and
     // iteration cap (see ExactRiemannFlux.h); ignored unless flux_scheme is
@@ -356,12 +462,31 @@ public:
     //     flux_scheme/gradient_scheme/exact_riemann_*/mu/prandtl/gas_constant above)
     double prandtl_t = 0.9;                 // Turbulent Prandtl number, dimensionless (~0.9 for air); no Navier-Stokes analog
     double initial_nut = 0.0;               // Uniform initial nut applied to every cell; SA is documented as sensitive to this choice
-    EulerInitialCondition rans_ic;           // Mean-flow initial condition, in primitive variables (own storage, same grammar as ns_ic)
-    std::vector<RANSBoundaryConditionSpec> rans_boundary_conditions; // Per-patch boundary condition assignments
+    EulerInitialCondition ransSA_ic;           // Mean-flow initial condition, in primitive variables (own storage, same grammar as ns_ic)
+    std::vector<RANSBoundaryConditionSpecSA> ransSA_boundary_conditions; // Per-patch boundary condition assignments
     // SA-noft2 model constants (see SpalartAllmaras.h); default to the
     // standard set. Exposed for experimentation, not because they are meant
     // to be tuned in normal use.
     SAModelConstants sa_constants;
+
+    // --- RANS (k-omega SST)-only parameters --- (reuses gamma/cfl/
+    //     flux_scheme/gradient_scheme/exact_riemann_*/mu/prandtl/gas_constant/
+    //     prandtl_t above)
+    double initial_k = 0.0, initial_omega = 0.0; // Uniform initial k/omega applied to every cell; see class comment
+    bool initial_k_set = false, initial_omega_set = false; // Recorded so sst_turbulence_intensity/
+                                              // sst_eddy_viscosity_ratio only derive a value the case
+                                              // file didn't set explicitly -- same *_set convention as
+                                              // reference_density_set below.
+    double sst_turbulence_intensity = 0.0;   // Tu, dimensionless; only used to derive initial_k/initial_omega
+    double sst_eddy_viscosity_ratio = 0.0;   // nu_t/nu, dimensionless; only used to derive initial_k/initial_omega
+    SSTLimiterVariant sst_limiter_variant = SSTLimiterVariant::Vorticity; // see SSTKOmega.h
+    bool sst_kato_launder = false;           // see SSTKOmega.h's compute_sst_source_terms()
+    EulerInitialCondition ransSST_ic;          // Mean-flow initial condition, in primitive variables (own storage, same grammar as ransSA_ic)
+    std::vector<RANSBoundaryConditionSpecSST> ransSST_boundary_conditions; // Per-patch boundary condition assignments
+    // SST model constants (see SSTKOmega.h); default to the NASA TMR set.
+    // Exposed for experimentation, not because they are meant to be tuned in
+    // normal use.
+    SSTModelConstants sst_constants;
 
     // Resolution-adequacy diagnostic (see NavierStokesFVMSolver::compute_resolution_diagnostics()):
     // NOT a claim about 3D DNS -- this solver is 2D-only, and classical
@@ -381,7 +506,7 @@ public:
     // (see WallReferenceQuantities, WallTraction.h). Each *_set flag records
     // whether the case file explicitly set the corresponding value; when
     // false, CaseInput::load() defaults it from the first ns_farfield (or, for
-    // equation == RANS, rans_farfield) patch's prescribed state -- resolved
+    // equation == RANS_SA, ransSA_farfield) patch's prescribed state -- resolved
     // (and validated as an error if no such patch exists to default from)
     // only when wall_forces_file or wall_profile_file is actually set, so an
     // unrelated case file is never broken by these keys' absence.

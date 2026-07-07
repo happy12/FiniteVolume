@@ -151,6 +151,20 @@ bool Checkpoint::write(const std::string& filename, CheckpointEquation equation,
     return static_cast<bool>(out);
 }
 
+bool Checkpoint::write(const std::string& filename, CheckpointEquation equation, long long step_index,
+                        unsigned long long build_number, const std::vector<EulerState>& U,
+                        const std::vector<double>& k, const std::vector<double>& omega) {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out.is_open()) {
+        return false;
+    }
+    write_header(out, equation, step_index, build_number, U.size());
+    out.write(reinterpret_cast<const char*>(U.data()), U.size() * sizeof(EulerState));
+    out.write(reinterpret_cast<const char*>(k.data()), k.size() * sizeof(double));
+    out.write(reinterpret_cast<const char*>(omega.data()), omega.size() * sizeof(double));
+    return static_cast<bool>(out);
+}
+
 bool Checkpoint::read(const std::string& filename, CheckpointEquation expected_equation, size_t expected_cell_count,
                        long long& out_step_index, unsigned long long& out_build_number, std::vector<double>& out_phi) {
     std::ifstream in(filename, std::ios::binary);
@@ -209,6 +223,40 @@ bool Checkpoint::read(const std::string& filename, CheckpointEquation expected_e
 
     out_nut.resize(expected_cell_count);
     in.read(reinterpret_cast<char*>(out_nut.data()), out_nut.size() * sizeof(double));
+    if (!in) {
+        std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short payload)\n";
+        return false;
+    }
+    return true;
+}
+
+bool Checkpoint::read(const std::string& filename, CheckpointEquation expected_equation, size_t expected_cell_count,
+                       long long& out_step_index, unsigned long long& out_build_number, std::vector<EulerState>& out_U,
+                       std::vector<double>& out_k, std::vector<double>& out_omega) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+    if (!read_and_validate_header(in, filename, expected_equation, expected_cell_count, out_step_index, out_build_number)) {
+        return false;
+    }
+
+    out_U.resize(expected_cell_count);
+    in.read(reinterpret_cast<char*>(out_U.data()), out_U.size() * sizeof(EulerState));
+    if (!in) {
+        std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short payload)\n";
+        return false;
+    }
+
+    out_k.resize(expected_cell_count);
+    in.read(reinterpret_cast<char*>(out_k.data()), out_k.size() * sizeof(double));
+    if (!in) {
+        std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short payload)\n";
+        return false;
+    }
+
+    out_omega.resize(expected_cell_count);
+    in.read(reinterpret_cast<char*>(out_omega.data()), out_omega.size() * sizeof(double));
     if (!in) {
         std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short payload)\n";
         return false;

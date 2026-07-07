@@ -3,11 +3,14 @@
 A standalone, dependency-free 2D unstructured finite-volume solver. It solves
 scalar diffusion, advection-diffusion of a passive scalar, the compressible
 Euler equations, the compressible (laminar) Navier-Stokes equations, or the
-Navier-Stokes equations closed with a Spalart-Allmaras RANS turbulence model,
-on an arbitrary polygon mesh, driven by a plain-text case file, and writes
-results as legacy VTK files for viewing in ParaView (or similar). See
+Navier-Stokes equations closed with a Spalart-Allmaras or k-omega SST RANS
+turbulence model, on an arbitrary polygon mesh, driven by a plain-text case
+file, and writes results as legacy VTK files for viewing in ParaView (or
+similar). See
 [RANS (Spalart-Allmaras) turbulence closure](#rans-spalart-allmaras-turbulence-closure)
-for what the RANS closure does and does not validate before relying on it.
+and
+[RANS (k-omega SST) turbulence closure](#rans-k-omega-sst-turbulence-closure)
+for what each RANS closure does and does not validate before relying on it.
 
 This document is meant to be read start to finish by a human, and to serve
 as a lookup reference (by section) for an automated coding agent working on
@@ -23,13 +26,14 @@ doubt, the cited source file is the ground truth, not this document.
 5. [Mesh formats](#mesh-formats)
 6. [Solvers](#solvers)
 7. [Gradient reconstruction (shared infrastructure)](#gradient-reconstruction-shared-infrastructure)
-8. [Boundary conditions](#boundary-conditions)
-9. [Output format](#output-format)
-10. [Monitoring & stopping criteria](#monitoring--stopping-criteria)
-11. [Checkpointing & restart](#checkpointing--restart)
-12. [Performance (OpenMP)](#performance-openmp)
-13. [Known limitations](#known-limitations)
-14. [File map](#file-map)
+8. [Residual-based CFL ramping](#residual-based-cfl-ramping)
+9. [Boundary conditions](#boundary-conditions)
+10. [Output format](#output-format)
+11. [Monitoring & stopping criteria](#monitoring--stopping-criteria)
+12. [Checkpointing & restart](#checkpointing--restart)
+13. [Performance (OpenMP)](#performance-openmp)
+14. [Known limitations](#known-limitations)
+15. [File map](#file-map)
 
 ---
 
@@ -46,7 +50,7 @@ mesh file (.msh or .fvmesh)  --MeshReader::read-->  UnstructuredMesh
                                                                 |
                                      boundary conditions matched by patch name
                                                                 |
-  UnstructuredFVMSolver / AdvectionDiffusionFVMSolver / EulerFVMSolver / NavierStokesFVMSolver / RANSFVMSolver
+  UnstructuredFVMSolver / AdvectionDiffusionFVMSolver / EulerFVMSolver / NavierStokesFVMSolver / RANSTurbulenceSASolver / RANSTurbulenceSSTSolver
                                                                 |
                                     step() loop (residual/checkpoint/snapshots)
                                                                 |
@@ -77,7 +81,7 @@ diffusion), [`AdvectionDiffusionFVMSolver`](../include/AdvectionDiffusionFVMSolv
 (advection-diffusion of a passive scalar), [`EulerFVMSolver`](../include/EulerFVMSolver.h)
 (compressible Euler), [`NavierStokesFVMSolver`](../include/NavierStokesFVMSolver.h)
 (compressible Navier-Stokes — Euler plus a Newtonian viscous stress tensor
-and Fourier heat conduction), and [`RANSFVMSolver`](../include/RANSFVMSolver.h)
+and Fourier heat conduction), and [`RANSTurbulenceSASolver`](../include/RANSTurbulenceSASolver.h)
 (Navier-Stokes plus a Spalart-Allmaras one-equation RANS turbulence closure —
 see [RANS (Spalart-Allmaras) turbulence closure](#rans-spalart-allmaras-turbulence-closure)
 for what this closure does and does not validate before relying on it).
@@ -122,10 +126,11 @@ FiniteVolume.exe --verify-gradient               # self-contained GradientCalcul
 FiniteVolume.exe --verify-advdiff                # self-contained advection-diffusion check, exit
 FiniteVolume.exe --verify-ns-uniform             # self-contained NS uniform-flow check, exit
 FiniteVolume.exe --verify-couette                # self-contained Couette flow validation, exit
+FiniteVolume.exe --verify-cfl-ramp                # self-contained next_cfl() unit + fixed-vs-ramp Couette check, exit
 FiniteVolume.exe --verify-ns-stretched-cfl       # self-contained anisotropic-mesh compute_dt() check, exit
 FiniteVolume.exe --verify-wall-distance          # self-contained wall-distance module check, exit
 FiniteVolume.exe --verify-sa-source              # self-contained SA source-term check, exit
-FiniteVolume.exe --verify-rans-stability         # self-contained RANSFVMSolver stability check, exit
+FiniteVolume.exe --verify-rans-stability         # self-contained RANSTurbulenceSASolver stability check, exit
 FiniteVolume.exe --verify-flat-plate             # self-contained RANS flat-plate boundary-layer check, exit
 FiniteVolume.exe --verify-wall-forces            # self-contained wall force/Cf/Cp/y+/Cm check, exit
 FiniteVolume.exe --verify-bl-marching-unstructured  # boundary-layer-marching unstructured-mesh stress test, exit
@@ -155,6 +160,15 @@ FiniteVolume.exe --verify-bl-point-location      # point-location BL alternative
   actually verifies and why (including two dead ends found and corrected
   while building the Couette one — worth reading before trusting a
   superficially similar test mesh in a new context).
+- `--verify-cfl-ramp` checks [`CflRamp.h`](../include/CflRamp.h)'s `next_cfl()`
+  against synthetic residual sequences; reruns `--verify-couette`'s own
+  setup once at a fixed `cfl` and once in `cfl_mode = ramp` targeting the same
+  ceiling, confirming both converge to the same steady solution; bisects for a
+  `cfl` that diverges fixed-mode on `--verify-ns-stretched-cfl`'s stretched
+  mesh and confirms `ramp` mode survives targeting it as the ceiling; and
+  reruns `--verify-sst-flat-plate`'s own setup fixed vs. ramp, confirming the
+  `nu_t/nu` decay-to-laminar verdict is unchanged — see
+  [Residual-based CFL ramping](#residual-based-cfl-ramping).
 - `--verify-wall-distance`/`--verify-sa-source`/`--verify-rans-stability`/
   `--verify-flat-plate` are the equivalent gates for the RANS
   (Spalart-Allmaras) capability — see
@@ -190,7 +204,7 @@ ignored (no typo detection).
 |---|---|---|
 | `mesh_file` | *(required)* | Path to a `.msh` or `.fvmesh` mesh file |
 | `output_file` | *(required)* | Path to write the result `.vtk` file |
-| `equation` | `diffusion` | `diffusion`, `advection_diffusion`, `euler`, `navier_stokes`, or `rans` — selects the physics |
+| `equation` | `diffusion` | `diffusion`, `advection_diffusion`, `euler`, `navier_stokes`, `rans_sa`, or `rans_sst` — selects the physics |
 | `nsteps` | 500 | Absolute target step count (also the resume target — see [Checkpointing](#checkpointing--restart)) |
 | `residual_file` | *(disabled)* | CSV path for per-step residual history |
 | `residual_interval` | 1 | Write a `residual_file` row every N steps |
@@ -199,7 +213,8 @@ ignored (no typo detection).
 | `checkpoint_file` | *(disabled)* | Path to save/auto-resume solver state |
 | `residual_tolerance` | disabled | **Diffusion / advection-diffusion only.** Stop once residual < this |
 | `residual_tolerance_rho`, `_rho_u`, `_rho_v`, `_E` | disabled | **Euler / Navier-Stokes / RANS only.** Each independently optional; converged requires every one the user set to be satisfied simultaneously |
-| `residual_tolerance_nut` | disabled | **RANS only.** Checked alongside the four above |
+| `residual_tolerance_nut` | disabled | **RANS (Spalart-Allmaras) only.** Checked alongside the four above |
+| `residual_tolerance_k`, `residual_tolerance_omega` | disabled | **RANS (k-omega SST) only.** Checked alongside the four above |
 | `scratch_dir` | *(disabled)* | Base directory for *relative* `output_file`/`checkpoint_file`/`residual_file` paths; absolute paths and `mesh_file` are unaffected |
 | `output_precision` | 6 | Significant digits for every output double (VTK results/snapshots, `residual_file` CSV, `FvMeshWriter`); valid range 1-17 |
 | `gradient_scheme` | `least-squares` | **Advection-diffusion / Navier-Stokes / RANS only.** `least-squares` or `green-gauss` — see [Gradient reconstruction](#gradient-reconstruction-shared-infrastructure) |
@@ -229,7 +244,13 @@ means the same thing for both), plus:
 | Key | Default | Meaning |
 |---|---|---|
 | `gamma` | 1.4 | Ratio of specific heats |
-| `cfl` | 0.5 | CFL number controlling the adaptive time step |
+| `cfl` | 0.5 | CFL number controlling the adaptive time step; in `cfl_mode = ramp`, the ceiling the ramp grows toward, not a fixed value used from step 1 |
+| `cfl_mode` | `fixed` | `fixed` (today's behavior, unchanged) or `ramp` (residual-based CFL ramping, starting at `cfl_min` and growing toward `cfl` as the run converges — see [Residual-based CFL ramping](#residual-based-cfl-ramping)). Also applies to `navier_stokes`/`rans_sa`/`rans_sst` below; ignored for `diffusion`/`advection_diffusion`, which use `dt`/`alpha` directly |
+| `cfl_min` | 0.05 | `cfl_mode = ramp` only: starting/floor CFL |
+| `cfl_ramp_growth` | 1.5 | `cfl_mode = ramp` only: multiplier applied when the monitored residual's windowed trend is decreasing |
+| `cfl_ramp_shrink` | 0.5 | `cfl_mode = ramp` only: multiplier applied when the trend is mildly rising |
+| `cfl_ramp_window` | 15 | `cfl_mode = ramp` only: number of steps of residual history the trend is computed over |
+| `cfl_ramp_divergence_threshold` | 2.0 | `cfl_mode = ramp` only: a `log10(residual)` rise over the window beyond this forces a hard reset to `cfl_min` |
 | `flux_scheme` | `rusanov` | Numerical flux at every face: `rusanov`, `hllc`, or `exact` (see [Discontinuity handling](#discontinuity-handling-shock-capturing)) |
 | `exact_riemann_tol` | `1e-6` | Relative pressure tolerance for the `exact` flux scheme's Newton-Raphson star-pressure solve. Ignored unless `flux_scheme = exact`. **Not meant to be tuned in normal use** — exposed for transparency only; the default is the value this solver always used before this key existed. |
 | `exact_riemann_max_iter` | `20` | Iteration cap for that same Newton-Raphson solve (stops the iteration even if `exact_riemann_tol` is never reached). Ignored unless `flux_scheme = exact`. **Not meant to be tuned in normal use**, for the same reason as `exact_riemann_tol` above. |
@@ -251,11 +272,11 @@ unchanged), plus:
 | `gas_constant` | 1.0 | Specific gas constant `R` in `p = rho*R*T`; only used for temperature/heat conduction, never pressure/sound speed (Euler-inherited physics never needed `R`). **Unvalidated**, same caveat as `prandtl` |
 | `resolution_report_file` | *(disabled)* | CSV path for a resolution-adequacy diagnostic — **not** a claim about 3D DNS; see [Known limitations](#known-limitations) |
 | `resolution_report_interval` | 1 | Write a `resolution_report_file` row every N steps |
-| `wall_forces_file` | *(disabled)* | CSV path, one row per `(step, patch)`: `friction_drag`/`pressure_drag`/`total_drag`/`cd_friction`/`cd_pressure`/`cd_total`/`lift`/`cl`/`moment`/`cm` over every `ns_wall*`/`rans_wall*` patch, plus a `TOTAL` row — see [Wall diagnostics](#wall-diagnostics) |
+| `wall_forces_file` | *(disabled)* | CSV path, one row per `(step, patch)`: `friction_drag`/`pressure_drag`/`total_drag`/`cd_friction`/`cd_pressure`/`cd_total`/`lift`/`cl`/`moment`/`cm` over every `ns_wall*`/`ransSA_wall*`/`ransSST_wall*` patch, plus a `TOTAL` row — see [Wall diagnostics](#wall-diagnostics) |
 | `wall_forces_interval` | 1 | Write a `wall_forces_file` row block every N steps |
 | `wall_profile_file` | *(disabled)* | CSV path, one row per wall mesh node: `x`/`y`/`patch_name`/`tau_wall`/`Cf`/`Cp`/`y_plus`/`delta_99`/`displacement_thickness`/`momentum_thickness`/`shape_factor` — see [Wall diagnostics](#wall-diagnostics) |
 | `wall_profile_interval` | 0 | Write a numbered `wall_profile_file` snapshot every N steps if `> 0`; the plain `wall_profile_file` path itself is always (re)written once at the run's natural end regardless |
-| `reference_density`, `reference_velocity_x`, `reference_velocity_y`, `reference_pressure` | *(auto)* | Freestream values for `Cf`/`Cp`/`Cd`/`Cl`/`Cm`'s dynamic-pressure normalization and drag direction; if any is unset, defaults from the first `ns_farfield` (or, for `equation = rans`, `rans_farfield`) patch's prescribed state. Only resolved/validated (and a load-time error if no such patch exists to default from) when `wall_forces_file` or `wall_profile_file` is set |
+| `reference_density`, `reference_velocity_x`, `reference_velocity_y`, `reference_pressure` | *(auto)* | Freestream values for `Cf`/`Cp`/`Cd`/`Cl`/`Cm`'s dynamic-pressure normalization and drag direction; if any is unset, defaults from the first `ns_farfield` (or, for `equation = rans_sa`, `ransSA_farfield`; `equation = rans_sst`, `ransSST_farfield`) patch's prescribed state. Only resolved/validated (and a load-time error if no such patch exists to default from) when `wall_forces_file` or `wall_profile_file` is set |
 | `reference_length` | 1.0 | Length scale for `Cd`/`Cl`/`Cm` (e.g. chord); `1.0` degrades gracefully to a per-unit-span coefficient |
 | `moment_reference_x`, `moment_reference_y` | 0.0, 0.0 | Point `Cm` is taken about (e.g. an airfoil's quarter-chord) |
 | `boundary_layer_method` | `marching` | `marching` (cheap, assumes a wall-normal cell stacking) or `point-location` (more expensive, no near-wall-topology assumption) — see [Wall diagnostics](#wall-diagnostics) |
@@ -274,7 +295,7 @@ unchanged), plus:
 `outflow` already mean something for Euler and must land in a different
 internal spec vector — see [`CaseInput.cpp`](../src/CaseInput.cpp).
 
-**RANS-only** (`equation = rans`): same `gamma`/`cfl`/`flux_scheme`/
+**RANS-only** (`equation = rans_sa`): same `gamma`/`cfl`/`flux_scheme`/
 `exact_riemann_tol`/`exact_riemann_max_iter`/`mu`/`prandtl`/`gas_constant`/
 `gradient_scheme` keys as Navier-Stokes above (`mu`/`prandtl`/`gas_constant`
 govern the mean-flow molecular terms exactly as they do for Navier-Stokes),
@@ -285,23 +306,50 @@ plus:
 | `prandtl_t` | 0.9 | Turbulent Prandtl number (air's value); no Navier-Stokes analog |
 | `initial_nut` | 0.0 | Uniform initial nu-tilde applied to every cell. SA is documented as sensitive to this choice — see [RANS (Spalart-Allmaras) turbulence closure](#rans-spalart-allmaras-turbulence-closure) |
 | `sa_cb1`, `sa_cb2`, `sa_sigma`, `sa_kappa`, `sa_cw2`, `sa_cw3`, `sa_cv1`, `sa_cv2`, `sa_cv3` | the standard SA-noft2 set (see [SpalartAllmaras.h](../include/SpalartAllmaras.h)) | Each independently optional. **Not meant to be tuned in normal use** — exposed for experimentation, same spirit as `exact_riemann_tol` above |
-| `rans_init = freestream <rho> <u> <v> <p>` | — | Uniform initial mean-flow state everywhere (own storage; same grammar as `ns_init`) |
-| `rans_init = tworegion <rho_l> <u_l> <v_l> <p_l> <rho_r> <u_r> <v_r> <p_r> <x0>` | — | Left/right split at `x_centroid = x0` |
-| `boundary <patch> rans_wall` | — | No-slip, stationary, adiabatic; wall nut is fixed at 0 by the SA model itself, not case-configurable |
-| `boundary <patch> rans_wall_isothermal <T>` | — | No-slip, stationary, fixed wall temperature `T` |
-| `boundary <patch> rans_wall_moving <u> <v>` | — | No-slip, moving at `(u, v)`, adiabatic |
-| `boundary <patch> rans_wall_moving_isothermal <u> <v> <T>` | — | No-slip, moving, fixed wall temperature |
-| `boundary <patch> rans_farfield <rho> <u> <v> <p> <nut>` | — | Fixed prescribed mean-flow state plus a prescribed freestream nut (inviscid contribution only) |
-| `boundary <patch> rans_outflow` | — | Zero-gradient extrapolation, mean flow and nut alike (inviscid contribution only) |
+| `ransSA_init = freestream <rho> <u> <v> <p>` | — | Uniform initial mean-flow state everywhere (own storage; same grammar as `ns_init`) |
+| `ransSA_init = tworegion <rho_l> <u_l> <v_l> <p_l> <rho_r> <u_r> <v_r> <p_r> <x0>` | — | Left/right split at `x_centroid = x0` |
+| `boundary <patch> ransSA_wall` | — | No-slip, stationary, adiabatic; wall nut is fixed at 0 by the SA model itself, not case-configurable |
+| `boundary <patch> ransSA_wall_isothermal <T>` | — | No-slip, stationary, fixed wall temperature `T` |
+| `boundary <patch> ransSA_wall_moving <u> <v>` | — | No-slip, moving at `(u, v)`, adiabatic |
+| `boundary <patch> ransSA_wall_moving_isothermal <u> <v> <T>` | — | No-slip, moving, fixed wall temperature |
+| `boundary <patch> ransSA_farfield <rho> <u> <v> <p> <nut>` | — | Fixed prescribed mean-flow state plus a prescribed freestream nut (inviscid contribution only) |
+| `boundary <patch> ransSA_outflow` | — | Zero-gradient extrapolation, mean flow and nut alike (inviscid contribution only) |
 
 `wall_forces_file`/`wall_profile_file`/`reference_*`/`boundary_layer_*` (see
 Navier-Stokes above) all apply to RANS too, using `mu + rho*nu_t` as the
 effective viscosity in place of `mu` — see
 [Wall diagnostics](#wall-diagnostics).
 
+**RANS (k-omega SST)-only** (`equation = rans_sst`): same `gamma`/`cfl`/
+`flux_scheme`/`exact_riemann_tol`/`exact_riemann_max_iter`/`mu`/`prandtl`/
+`gas_constant`/`gradient_scheme`/`prandtl_t` keys as RANS (Spalart-Allmaras)
+above, plus:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `initial_k`, `initial_omega` | 0.0, 0.0 | Uniform initial `k`/`omega` applied to every cell |
+| `sst_turbulence_intensity`, `sst_eddy_viscosity_ratio` | 0.0, 0.0 | `Tu` (dimensionless) and `nu_t/nu` (dimensionless); when both are set AND `initial_k`/`initial_omega` are NOT set explicitly, derive them from the `ransSST_init` freestream velocity and `mu`/`rho` (`k = 1.5*(Tu*|U|)^2`, `omega = k/(ratio*nu)`) — a friendlier input than raw `k`/`omega` values, mirroring SA's `initial_nut` convention |
+| `sst_limiter` | `vorticity` | `vorticity` (original 1994 SST) or `strain_rate` (2003 revision) — see [RANS (k-omega SST) turbulence closure](#rans-k-omega-sst-turbulence-closure) |
+| `sst_kato_launder` | `false` | Kato-Launder production limiter (`true`/`false`); SST-specific, no SA analogue |
+| `sst_beta_star`, `sst_kappa`, `sst_a1`, `sst_sigma_k1`, `sst_sigma_k2`, `sst_sigma_omega1`, `sst_sigma_omega2`, `sst_beta1`, `sst_beta2` | the NASA Turbulence Modeling Resource set (see [SSTKOmega.h](../include/SSTKOmega.h)) | Each independently optional. **Not meant to be tuned in normal use** — same spirit as `sa_*` above |
+| `residual_tolerance_k`, `residual_tolerance_omega` | -1.0, -1.0 (disabled) | Stopping-criteria tolerances, checked alongside `residual_tolerance_rho`/etc. |
+| `ransSST_init = freestream <rho> <u> <v> <p>` | — | Uniform initial mean-flow state everywhere (own storage; same grammar as `ransSA_init`) |
+| `ransSST_init = tworegion <rho_l> <u_l> <v_l> <p_l> <rho_r> <u_r> <v_r> <p_r> <x0>` | — | Left/right split at `x_centroid = x0`. `sst_turbulence_intensity`/`sst_eddy_viscosity_ratio` derivation above only applies to a `freestream` initial condition (no single velocity magnitude to derive `Tu` from otherwise) |
+| `boundary <patch> ransSST_wall` | — | No-slip, stationary, adiabatic; wall `k` is fixed at 0 and `omega` follows the model's own near-wall formula, neither case-configurable |
+| `boundary <patch> ransSST_wall_isothermal <T>` | — | No-slip, stationary, fixed wall temperature `T` |
+| `boundary <patch> ransSST_wall_moving <u> <v>` | — | No-slip, moving at `(u, v)`, adiabatic |
+| `boundary <patch> ransSST_wall_moving_isothermal <u> <v> <T>` | — | No-slip, moving, fixed wall temperature |
+| `boundary <patch> ransSST_farfield <rho> <u> <v> <p> <k> <omega>` | — | Fixed prescribed mean-flow state plus prescribed freestream `k`/`omega` (inviscid contribution only) — explicit per-patch values, NOT derived from `sst_turbulence_intensity`/`sst_eddy_viscosity_ratio` |
+| `boundary <patch> ransSST_outflow` | — | Zero-gradient extrapolation, mean flow and `k`/`omega` alike (inviscid contribution only) |
+
+`wall_forces_file`/`wall_profile_file`/`reference_*`/`boundary_layer_*` (see
+Navier-Stokes above) all apply to RANS (k-omega SST) too, using
+`mu + rho*nu_t` as the effective viscosity in place of `mu`, same as SA.
+
 A patch present in the mesh but with no matching `boundary` line defaults
 to Dirichlet 0.0 (diffusion/advection-diffusion), Wall (Euler), `ns_wall` —
-adiabatic, stationary (Navier-Stokes), or `rans_wall` — adiabatic, stationary
+adiabatic, stationary (Navier-Stokes), `ransSA_wall` — adiabatic, stationary,
+or `ransSST_wall` — adiabatic, stationary
 (RANS), and prints a warning — it does not fail the run.
 
 Example (diffusion):
@@ -390,7 +438,7 @@ before trusting this closure's turbulent behavior on a real case):
 ```
 mesh_file = mesh/channel.fvmesh
 output_file = output/result.vtk
-equation = rans
+equation = rans_sa
 gamma = 1.4
 cfl = 0.3
 mu = 0.02
@@ -400,12 +448,12 @@ gas_constant = 1.0
 initial_nut = 0.06
 nsteps = 20000
 
-rans_init = freestream 1.0 0.1 0.0 1.0
+ransSA_init = freestream 1.0 0.1 0.0 1.0
 
-boundary bottom rans_wall
-boundary top rans_wall_moving 0.1 0.0
-boundary left rans_farfield 1.0 0.1 0.0 1.0 0.06
-boundary right rans_outflow
+boundary bottom ransSA_wall
+boundary top ransSA_wall_moving 0.1 0.0
+boundary left ransSA_farfield 1.0 0.1 0.0 1.0 0.06
+boundary right ransSA_outflow
 
 residual_file = output/residual.csv
 checkpoint_file = output/checkpoint.bin
@@ -661,7 +709,7 @@ design discussion; this section summarizes the result.
 (boundary-layer thickness), and Phase 3 (the point-location boundary-layer
 alternative, `compute_boundary_layer_profiles_point_location()` below, built
 and verified in direct response to Phase 2's own stress-test finding) are all
-implemented and verified. Wiring `RANSFVMSolver` into `CaseInput`/`main.cpp`
+implemented and verified. Wiring `RANSTurbulenceSASolver` into `CaseInput`/`main.cpp`
 so it could adopt these same wall diagnostics was a separate, larger,
 pre-existing gap outside this plan's own original scope — that gap is now
 closed too (see
@@ -676,7 +724,7 @@ closed too (see
   assembly `step()` itself uses. `Cf`, `Cp`, and `y+` are derived from this
   per-face sample plus a `WallReferenceQuantities` (freestream density/
   velocity/pressure, a length scale, and a moment reference point) —
-  reference-agnostic by design, which is exactly what let `RANSFVMSolver`
+  reference-agnostic by design, which is exactly what let `RANSTurbulenceSASolver`
   adopt the same struct with `mu + rho*nu_t` in place of `mu` (see
   [RANS (Spalart-Allmaras) turbulence closure](#rans-spalart-allmaras-turbulence-closure)).
 - **`compute_wall_forces()`** integrates friction + pressure force (and
@@ -731,30 +779,30 @@ closed too (see
   than face-midpoint samples offset from them.
 - `wall_forces_file` and `wall_profile_file` are Navier-Stokes/RANS-only
   case-file keys (see the tables above), wired in `run_navier_stokes()`/
-  `run_rans()` following `resolution_report_file`'s exact existing precedent
+  `run_ransSA()` following `resolution_report_file`'s exact existing precedent
   (`ensure_parent_directory`, `scratch_dir` rebasing, opened once/appended
   every N steps for `wall_forces_file`; `wall_profile_file` instead follows
   `output_file`/`write_interval`'s convention — a numbered snapshot every N
   steps if `wall_profile_interval > 0`, and the plain path always
   (re)written once at the run's natural end, including on divergence, for
   the same "still written for inspection" reason `output_file` is).
-  `RANSFVMSolver::compute_wall_traction_samples()`/
+  `RANSTurbulenceSASolver::compute_wall_traction_samples()`/
   `compute_boundary_layer_profile_samples[_point_location]()` mirror
   `NavierStokesFVMSolver`'s identically-named methods exactly, substituting
   `mu + rho*nu_t` for `mu` as the effective viscosity fed to
-  `compute_wall_traction()`. Note `RANSFVMSolver` has no
+  `compute_wall_traction()`. Note `RANSTurbulenceSASolver` has no
   `resolution_report_file`-equivalent diagnostic — that key stays
   Navier-Stokes-only.
 - `--verify-flat-plate`'s Blasius/Pohlhausen extension predates this wiring
   and still calls `compute_wall_traction()`/`compute_boundary_layer_profiles()`
   directly from the verification harness as a one-off, rather than through
-  `RANSFVMSolver`'s member methods — both paths reuse the same underlying
+  `RANSTurbulenceSASolver`'s member methods — both paths reuse the same underlying
   `WallTraction.h` functions, so this is a difference in call site, not in
   what's actually computed.
 
 ### RANS (Spalart-Allmaras) turbulence closure
 
-[`RANSFVMSolver`](../include/RANSFVMSolver.h) is a fifth, independent solver
+[`RANSTurbulenceSASolver`](../include/RANSTurbulenceSASolver.h) is a fifth, independent solver
 class — not a toggle on `NavierStokesFVMSolver`, per this project's existing
 "one class per equation set" pattern (see
 [docs/archive/rans-spalart-allmaras-tracker.md](archive/rans-spalart-allmaras-tracker.md)'s
@@ -783,7 +831,7 @@ flux, ghost-state, and `compute_dt()` structure unchanged, and adds:
   turbulence-inclusive effective values, `mu_eff = mu + rho*nu_t` and
   `k_eff = cp*(mu/Pr + rho*nu_t/Pr_t)` (`Pr_t` = turbulent Prandtl number,
   `nu_t = nut * fv1`).
-- `RANSBoundaryCondition` wraps `NSBoundaryCondition` unchanged (a no-slip
+- `RANSBoundaryConditionSA` wraps `NSBoundaryCondition` unchanged (a no-slip
   wall/farfield/outflow means the same thing for the mean-flow equations
   here) and adds only `farfield_nut` — the freestream `nut` a `Farfield`
   boundary prescribes; SA is documented as sensitive to this choice.
@@ -794,20 +842,20 @@ flux, ghost-state, and `compute_dt()` structure unchanged, and adds:
   two adjoining cells' `nu_t`) rather than just molecular `nu` — `nu_t` can
   be 10-1000x molecular `nu` in a real turbulent boundary layer.
 
-**Reachable from a case file via `equation = rans`.** `run_rans()` in
+**Reachable from a case file via `equation = rans_sa`.** `run_ransSA()` in
 [main.cpp](../src/main.cpp) drives it the same way `run_navier_stokes()`
-drives `NavierStokesFVMSolver` — same checkpointing (`CheckpointEquation::RANS`
+drives `NavierStokesFVMSolver` — same checkpointing (`CheckpointEquation::RANS_SA`
 round-trips both the mean-flow state and `nut` in one file; see
 [Checkpointing & restart](#checkpointing--restart)), residual tracking (a
 `residual_nut` column alongside `rho`/`rho_u`/`rho_v`/`E`, plus an optional
 `residual_tolerance_nut` stopping criterion), and wall diagnostics (see
 [Wall diagnostics](#wall-diagnostics)) as the other solvers get. VTK output
-(`write_rans_fields()`) adds `nut` and the derived `nu_t` to the usual
+(`write_ransSA_fields()`) adds `nut` and the derived `nu_t` to the usual
 `rho`/`u`/`v`/`p`/`mach`/`T` fields. See the RANS-only case-file table above
 for every `rans_*`/`sa_*`/`prandtl_t`/`initial_nut` key this adds over
 Navier-Stokes. `--verify-rans-stability`/`--verify-flat-plate` (see
 [Running](#running)) predate this wiring and still construct
-`RANSFVMSolver` directly rather than through a case file — they remain this
+`RANSTurbulenceSASolver` directly rather than through a case file — they remain this
 project's correctness gate for the solver itself, independent of the
 case-file plumbing around it.
 
@@ -821,6 +869,108 @@ the laminar Pohlhausen profile instead. See
 [docs/archive/rans-spalart-allmaras-tracker.md](archive/rans-spalart-allmaras-tracker.md)
 Phase 4 for the full cost/benefit reasoning behind that decision before
 assuming this solver validates real turbulent-flow predictions.
+
+### RANS (k-omega SST) turbulence closure
+
+[`RANSTurbulenceSSTSolver`](../include/RANSTurbulenceSSTSolver.h) is a sixth,
+independent solver class — a second RANS closure alongside
+`RANSTurbulenceSASolver`, not a toggle on it or on `NavierStokesFVMSolver`,
+per this project's "one class per equation set" pattern (see
+[docs/sst-komega-tracker.md](sst-komega-tracker.md)'s architecture decision).
+It duplicates `NavierStokesFVMSolver`'s inviscid flux, ghost-state, and
+`compute_dt()` structure unchanged, and adds:
+
+- Two extra transported scalars, `k` and `omega` (Menter's k-omega SST,
+  1994/2003 revision), with production/destruction/cross-diffusion source
+  terms and the `F1`/`F2` blending functions from
+  [SSTKOmega.h](../include/SSTKOmega.h)/[.cpp](../src/SSTKOmega.cpp). Unlike
+  `nut` (never `rho`-weighted, following SA's own classical form), `k`/`omega`
+  are transported in Menter's compressible `rho`-weighted form: the
+  conserved quantities across a step are `rho*k`/`rho*omega` (exactly like
+  `EulerState` conserves `rho_u`/`rho_v`, not `u`/`v`), though the class
+  still exposes/stores primitive `k`/`omega` (same external shape as SA's
+  `nut`) — see that header's own class comment for the bookkeeping.
+- Two eddy-viscosity limiter variants, selectable per solver instance
+  (`SSTLimiterVariant::Vorticity`, the original 1994 formulation, or
+  `::StrainRate`, the 2003 revision), each paired with its own
+  production-clip coefficient (`20` vs. `10` times `beta_star*rho*omega*k`) —
+  NASA's Turbulence Modeling Resource documents both as genuinely different,
+  separately-verified variants, not a single "correct" choice.
+- An optional Kato-Launder production limiter (`kato_launder` constructor
+  parameter / `sst_kato_launder` case-file key): replaces production's `S^2`
+  with `S*Omega` to prevent stagnation-point turbulence over-production;
+  SST-specific, no SA analogue. Defaults off.
+- The same general wall-distance field as SA (`compute_wall_distance()`),
+  feeding `F1`/`F2` at every cell — plus, at each `NoSlipWall` boundary
+  face specifically, a per-face first-cell-centroid distance from
+  `face_normal_distance()` ([GradientReconstruction.h](../include/GradientReconstruction.h)),
+  needed by `omega`'s own analytically-singular wall boundary value below.
+- Molecular viscosity/conductivity in the mean-flow viscous terms replaced by
+  `mu_eff = mu + rho*nu_t` / `k_eff = cp*(mu/Pr + rho*nu_t/Pr_t)`, same as SA
+  — `nu_t` here comes from `sst_eddy_viscosity()` (needs `S`/`Omega`/`F2`,
+  unlike SA's simpler `fv1(nut, nu)`).
+- `k`/`omega`'s own diffusive flux scales ONLY the turbulent part by a
+  blended (`F1`-weighted) `sigma_k`/`sigma_omega`, leaving molecular
+  viscosity unscaled (`mu + sigma_k*mu_t`) — a genuinely different model form
+  than SA's nut diffusion, which divides the WHOLE `(nu_lam+nu_t)` sum by a
+  single constant `sigma`.
+- `RANSBoundaryConditionSST` wraps `NSBoundaryCondition` unchanged and adds
+  `farfield_k`/`farfield_omega` — the freestream values a `Farfield` boundary
+  prescribes. `NoSlipWall`'s values are NOT case-configurable: `k_wall = 0`
+  exactly, and `omega_wall = 60*nu/(beta1*d1^2)` (`d1` = that face's own
+  first-cell-centroid distance, see above) — this near-wall formula is the
+  single hardest piece of this implementation; see
+  [docs/sst-komega-tracker.md](sst-komega-tracker.md) Phase 2/3 for the
+  debugging history. `Outflow`'s is a zero-order extrapolation.
+- `compute_dt()` adds a genuinely new explicit-source stability limit
+  (`cfl / (max(beta_star, beta1, beta2) * omega)`) beyond the diffusion-CFL
+  term SA/Navier-Stokes already use — `omega`'s near-wall value can be large
+  enough that a plain diffusion-CFL `dt` overshoots its own destruction term
+  in a single explicit step; this is what actually keeps a run stable, not a
+  cosmetic addition. See [docs/sst-komega-tracker.md](sst-komega-tracker.md)
+  Phase 2 for the full derivation, including why the diffusion term itself
+  needed no separate `sigma`-scaled candidate.
+
+**Reachable from a case file via `equation = rans_sst`.** `run_ransSST()` in
+[main.cpp](../src/main.cpp) drives it the same way `run_ransSA()` drives
+`RANSTurbulenceSASolver` — same checkpointing (`CheckpointEquation::RANS_SST`
+round-trips the mean-flow state, `k`, AND `omega` in one file; see
+[Checkpointing & restart](#checkpointing--restart)), residual tracking
+(`residual_k`/`residual_omega` columns alongside `rho`/`rho_u`/`rho_v`/`E`,
+plus optional `residual_tolerance_k`/`residual_tolerance_omega` stopping
+criteria), and wall diagnostics (see [Wall diagnostics](#wall-diagnostics),
+using `mu + rho*nu_t` as the effective viscosity, `nu_t` recomputed from
+fresh gradients each call since it needs `S`/`Omega`/`F2`) as the other
+solvers get. VTK output (`write_ransSST_fields()`) adds `k`, `omega`, and the
+derived `nu_t` to the usual `rho`/`u`/`v`/`p`/`mach`/`T` fields.
+`initial_k`/`initial_omega` can be set directly, or derived from
+`sst_turbulence_intensity`/`sst_eddy_viscosity_ratio` (a turbulence-intensity/
+eddy-viscosity-ratio pair applied to the `ransSST_init` freestream velocity
+and `mu`/`rho`) when left unset — mirroring SA's `initial_nut` convention,
+just with a friendlier input for a user who knows `Tu`% more readily than a
+raw `k`/`omega` pair. `--verify-sst-source`/`--verify-sst-stability` (see
+[Running](#running)) predate this wiring and still construct
+`SSTSourceTerms`/`RANSTurbulenceSSTSolver` directly rather than through a
+case file — they remain this project's correctness gate for the model/solver
+themselves, independent of the case-file plumbing around it.
+
+**Turbulence-sustaining behavior carries the same caveat as SA, now confirmed
+rather than just anticipated.** `--verify-sst-flat-plate` (mirroring
+`--verify-flat-plate`'s exact setup) shows `nu_t/nu` monotonically decaying
+from `1.6e-5` to `1.4e-6` over 20000 steps at `Re_L = 1e4` — the same
+decay-to-laminar signature SA's own flat-plate validation found (see
+[docs/archive/rans-spalart-allmaras-tracker.md](archive/rans-spalart-allmaras-tracker.md)
+Phase 4), and, as a cross-check, SST's converged solution lands on
+essentially the SAME laminar profile SA's does on the identical mesh/BCs
+(`L2 = 0.0752` for both against the Pohlhausen quartic profile). This
+project's explicit, density-based, acoustic-CFL-limited time-stepping (no
+low-Mach preconditioning or implicit stepping) is the shared ceiling —
+`omega`'s `1/d^2` near-wall stiffness does not relax it. See
+[docs/sst-komega-tracker.md](sst-komega-tracker.md) Phase 4 for the full
+result. Don't read either solver's flat-plate PASS as validating
+turbulence-sustaining behavior against a real turbulent reference — both
+confirm the plumbing holds together and produces a physically sane laminar
+result, nothing more.
 
 ## Gradient reconstruction (shared infrastructure)
 
@@ -868,7 +1018,7 @@ A third function, `face_normal_distance()`, returns the face-normal-
 projected distance between a face's two cell centroids (or a cell centroid
 and the face midpoint, for a boundary face) — the same `dist * cosTheta`
 quantity `face_gradient()` divides by internally, exposed standalone so
-`NavierStokesFVMSolver`/`RANSFVMSolver`'s `compute_dt()` can use the same
+`NavierStokesFVMSolver`/`RANSTurbulenceSASolver`'s `compute_dt()` can use the same
 length scale for their viscous stability estimate that the flux itself
 uses (see [docs/navier-stokes-tracker.md](navier-stokes-tracker.md) Phase 6).
 
@@ -877,6 +1027,69 @@ project's "no mesh-quality safeguards" stance (see
 [Mesh formats](#mesh-formats)), a cell whose neighbor points are nearly
 collinear could produce a near-singular least-squares normal-equation
 matrix with no diagnostic.
+
+## Residual-based CFL ramping
+
+Every one of the four `cfl`-driven solvers (`EulerFVMSolver`,
+`NavierStokesFVMSolver`, `RANSTurbulenceSASolver`, `RANSTurbulenceSSTSolver`)
+normally uses a single, fixed `cfl` for the entire run. Setting `cfl_mode =
+ramp` (see [Case file reference](#case-file-reference)) instead starts the
+run at `cfl_min` and grows it toward `cfl` (now the ceiling, not a value used
+from step 1) as the solution develops — avoiding the need to hand-tune one
+conservative `cfl` that survives a run's crude initial condition but leaves
+speed on the table once the flow has settled. This is a robustness/usability
+improvement for the initial transient, not a fix for the acoustic-CFL-limited
+turbulence-sustaining validation gap documented for SA/SST below — a ramp run
+still only reaches the same target `cfl` a fixed-CFL run at that target would
+use once warmed up.
+
+The rule lives in a single stateless function, `next_cfl()`
+([`include/CflRamp.h`](../include/CflRamp.h) /
+[`src/CflRamp.cpp`](../src/CflRamp.cpp)), called from `main.cpp`'s shared step
+loop for whichever of the four solvers is running (the same "cross-cutting
+run-control concern lives in `main.cpp`, not any solver's `step()`"
+precedent as residual tracking/checkpointing/stopping-criteria) — it has no
+reason to know about SA's `nut` vs SST's `k`/`omega` vs Euler's plain state,
+it only needs the density residual (`solver.residual().rho`, monitored every
+step) and a `set_cfl()` call. Loosely modeled on SU2's
+`CSolver::AdaptCFLNumber` (grow/shrink by a fixed factor based on a residual
+trend, clamped to a min/max), adapted from SU2's implicit, per-point CFL to
+this project's explicit, single-global-`cfl`-per-step solvers: no
+linear-solve/under-relaxation signal exists here to react to, so the trigger
+is purely a windowed trend in the log10 of the density residual over the last
+`cfl_ramp_window` steps (not a raw single-step ratio, which is noise-prone on
+a genuinely explicit solver) —
+
+- fewer than `cfl_ramp_window` residual samples so far: hold `cfl` unchanged
+  (deliberate: the run's first `cfl_ramp_window` steps stay at `cfl_min`
+  rather than reacting to the noisiest, least-representative steps of the
+  run);
+- the trend rises by more than `cfl_ramp_divergence_threshold` orders of
+  magnitude across the window: hard reset to `cfl_min` (SU2's divergence
+  path);
+- the trend is decreasing: grow by `cfl_ramp_growth`, clamped to `cfl`;
+- the trend is flat (within a fixed ~10% deadband) or rising up to the
+  divergence threshold: shrink by `cfl_ramp_shrink`, clamped to `cfl_min`.
+
+**Checkpoint interaction — a known limitation, not a bug.** A checkpoint
+round-trips solver field state only, not the ramp controller's residual
+history or `current_cfl`; resuming a checkpointed ramp run restarts the ramp
+at `cfl_min` every time. See [Checkpointing & restart](#checkpointing--restart).
+
+`--verify-cfl-ramp` (see [Running](#running)) checks `next_cfl()` directly
+against synthetic residual sequences (grow/shrink/hold/divergence-reset/
+warm-up), then end-to-end on the Couette-flow setup `--verify-couette` uses:
+a `cfl_mode = ramp` run targeting the same ceiling as a `cfl_mode = fixed`
+run must converge to the same steady solution, after actually starting at
+`cfl_min` and reaching the ceiling. Two more checks in the same gate go
+further: a bisection on `--verify-ns-stretched-cfl`'s stretched mesh finds a
+`cfl` that genuinely diverges in `fixed` mode (`2.69971` as of this writing),
+then confirms `ramp` mode survives targeting it as the ceiling; and a rerun
+of `--verify-sst-flat-plate`'s exact setup, fixed vs. ramp, confirms the
+`nu_t/nu` decay-to-laminar verdict is unchanged either way. See
+[docs/adaptive-cfl-ramp-plan.md](adaptive-cfl-ramp-plan.md)'s Validation plan
+for the full results, including a manual (not CLI-gated) backward-
+compatibility smoke test against the real NACA0012 RANS validation case file.
 
 ## Boundary conditions
 
@@ -904,12 +1117,20 @@ not by the mesh reader.
   [NavierStokesFVMSolver.h](../include/NavierStokesFVMSolver.h) /
   [.cpp](../src/NavierStokesFVMSolver.cpp)'s `ghost_state`. Deliberately its
   own type, not a Euler `EulerBoundaryType` extension.
-- **RANS**: `RANSBoundaryCondition` wraps an `NSBoundaryCondition` unchanged
-  (same `NoSlipWall`/`Farfield`/`Outflow` meanings as Navier-Stokes above)
-  and adds only `farfield_nut` (the transported `nut` scalar's prescribed
-  freestream value at a `Farfield` boundary) — see
-  [RANSFVMSolver.h](../include/RANSFVMSolver.h) and the `rans_*` boundary
-  keywords in the case-file reference above.
+- **RANS (Spalart-Allmaras)**: `RANSBoundaryConditionSA` wraps an
+  `NSBoundaryCondition` unchanged (same `NoSlipWall`/`Farfield`/`Outflow`
+  meanings as Navier-Stokes above) and adds only `farfield_nut` (the
+  transported `nut` scalar's prescribed freestream value at a `Farfield`
+  boundary) — see [RANSTurbulenceSASolver.h](../include/RANSTurbulenceSASolver.h)
+  and the `ransSA_*` boundary keywords in the case-file reference above.
+- **RANS (k-omega SST)**: `RANSBoundaryConditionSST` wraps an
+  `NSBoundaryCondition` unchanged the same way, and adds
+  `farfield_k`/`farfield_omega` (the transported `k`/`omega` scalars'
+  prescribed freestream values at a `Farfield` boundary). `NoSlipWall`'s
+  `k`/`omega` values are NOT case-configurable (`k_wall = 0`,
+  `omega_wall = 60*nu/(beta1*d1^2)`) — see
+  [RANSTurbulenceSSTSolver.h](../include/RANSTurbulenceSSTSolver.h) and the
+  `ransSST_*` boundary keywords in the case-file reference above.
 
 ## Output format
 
@@ -931,6 +1152,10 @@ written double (coordinates and field values) uses the case file's
 - **Navier-Stokes** writes the same five fields plus `T` (temperature, see
   `write_navier_stokes_fields` in [main.cpp](../src/main.cpp) and
   `temperature()` in [EulerState.h](../include/EulerState.h)).
+- **RANS (Spalart-Allmaras)** writes the same six fields plus `nut` and the
+  derived `nu_t` (`write_ransSA_fields` in [main.cpp](../src/main.cpp)).
+- **RANS (k-omega SST)** writes the same six fields plus `k`, `omega`, and
+  the derived `nu_t` (`write_ransSST_fields` in [main.cpp](../src/main.cpp)).
 
 `write_interval > 0` in the case file additionally writes numbered snapshots
 (`numbered_filename` in [main.cpp](../src/main.cpp) inserts a zero-padded
@@ -954,7 +1179,8 @@ A run stops (writing final output either way) on the first of:
    checkpoint is written**, and the process exits non-zero.
 2. **Convergence** — `residual_tolerance` (diffusion / advection-diffusion)
    or every `residual_tolerance_*` the user set (Euler / Navier-Stokes /
-   RANS, the latter adding `residual_tolerance_nut`) is satisfied.
+   RANS, the latter adding `residual_tolerance_nut` for Spalart-Allmaras or
+   `residual_tolerance_k`/`residual_tolerance_omega` for k-omega SST) is satisfied.
 3. **Ctrl+C** — a clean stop after the in-flight step.
 4. **`nsteps` reached** — the "natural" end.
 
@@ -975,12 +1201,15 @@ mean.
 
 [`Checkpoint`](../include/Checkpoint.h) writes a simple fixed-layout binary
 file (magic + format version + equation tag [`0` = Diffusion, `1` = Euler,
-`2` = AdvectionDiffusion, `3` = NavierStokes, `4` = RANS] + cell count + step
+`2` = AdvectionDiffusion, `3` = NavierStokes, `4` = RANS_SA, `5` = RANS_SST] + cell count + step
 index + build number + raw field doubles — **not portable across
-architectures**, only meant to round-trip on the same machine). RANS's
-payload is the mean-flow `EulerState` field immediately followed by `nut`,
-both resumed together via `RANSFVMSolver::set_field()`; this didn't require
-a format-version bump, since the fixed header is unchanged and the payload
+architectures**, only meant to round-trip on the same machine). RANS
+(Spalart-Allmaras)'s payload is the mean-flow `EulerState` field immediately
+followed by `nut`, both resumed together via `RANSTurbulenceSASolver::set_field()`.
+RANS (k-omega SST)'s payload is the mean-flow `EulerState` field immediately
+followed by `k`, immediately followed by `omega`, all three resumed together
+via `RANSTurbulenceSSTSolver::set_field()`. Neither required a format-version
+bump, since the fixed header is unchanged and the payload
 shape has always been a function of the equation tag alone. If `checkpoint_file` is set
 and that file already exists when a run starts, the run **auto-resumes from
 it** instead of using the case file's initial condition — this is how a
@@ -998,6 +1227,40 @@ not — it's informational only. **A checkpoint written by format version 1
 (before the build-number field existed) cannot be read by this version**;
 there is no migration path, since checkpoints are meant to round-trip a
 single in-progress run, not archive results long-term.
+
+### Stopping and resuming a run: step by step
+
+Checkpointing is decided at startup, not toggle-able mid-run — `checkpoint_file`
+must already be set in the case file *before* the run you intend to stop is
+started.
+
+1. Add `checkpoint_file = <path>` to the case file.
+2. Start the run as usual: `FiniteVolume.exe my_case.case`.
+3. To stop early, press **Ctrl+C in that same terminal**. It must be an
+   actual keypress delivered to the process's own console — closing the
+   terminal window, `taskkill`, and Ctrl+Break do **not** trigger this path,
+   since only `SIGINT` is handled (`std::signal(SIGINT, handle_sigint)` in
+   [main.cpp](../src/main.cpp); there is no `SIGBREAK` or console
+   close/logoff/shutdown handler). Any of those instead kills the process
+   immediately with nothing written.
+4. Wait for `Interrupted by user at step N` before doing anything else — the
+   in-flight step finishes first, and the checkpoint plus final
+   `output_file` are only written after that message's branch runs.
+   Force-killing the process before this line prints leaves nothing usable.
+5. To resume, rerun the exact same command with the case file otherwise
+   unchanged: `FiniteVolume.exe my_case.case`. The existing `checkpoint_file`
+   is auto-detected (see above) and the run picks up from step N+1 — no flag
+   needed. The mesh file and `equation` must be the ones the checkpoint was
+   written with, or the version/equation-tag/cell-count validation above
+   rejects it.
+
+The one non-obvious gotcha: `nsteps` is always an **absolute target step
+count**, not "how many more steps to run" (see
+[Monitoring & stopping criteria](#monitoring--stopping-criteria) above). If a
+run is interrupted at step 300 with `nsteps = 500` and the case file is
+rerun completely unchanged, it resumes and immediately stops again at
+step 500 — to actually keep going, raise `nsteps` (or loosen a
+`residual_tolerance*`) before rerunning.
 
 ## Performance (OpenMP)
 
@@ -1029,8 +1292,8 @@ used in whatever order the reader produced it.
   turbulent-regime flow run on a mesh that doesn't resolve every scale gives
   a real result that is *mesh-dependent* (changes character as you refine),
   not a converged approximation. A Spalart-Allmaras RANS closure exists
-  (`RANSFVMSolver`, no LES option) and **is reachable from a case file**
-  (`equation = rans`) — see
+  (`RANSTurbulenceSASolver`, no LES option) and **is reachable from a case file**
+  (`equation = rans_sa`) — see
   [RANS (Spalart-Allmaras) turbulence closure](#rans-spalart-allmaras-turbulence-closure).
   Its own verification target (a turbulent log-law boundary layer) was not
   reached at this project's tractable Reynolds numbers either — **don't treat
@@ -1067,7 +1330,7 @@ used in whatever order the reader produced it.
 - **`gas_constant`/`prandtl` are unvalidated** — a zero or negative value
   silently produces `Inf`/division-by-zero rather than a diagnostic.
 - **A strongly anisotropic mesh (e.g. boundary-layer-clustered) takes a
-  smaller adaptive `dt`** in `NavierStokesFVMSolver`/`RANSFVMSolver` than a
+  smaller adaptive `dt`** in `NavierStokesFVMSolver`/`RANSTurbulenceSASolver` than a
   mesh with similar-sized cells, since `compute_dt()`'s viscous stability
   term is now direction-aware rather than a plain volume/area average (see
   [docs/navier-stokes-tracker.md](navier-stokes-tracker.md) Phase 6) — more
@@ -1112,8 +1375,10 @@ used in whatever order the reader produced it.
 | Advection-diffusion solver | [AdvectionDiffusionFVMSolver.h](../include/AdvectionDiffusionFVMSolver.h) | [AdvectionDiffusionFVMSolver.cpp](../src/AdvectionDiffusionFVMSolver.cpp) |
 | Euler solver + physics | [EulerFVMSolver.h](../include/EulerFVMSolver.h), [EulerState.h](../include/EulerState.h) | [EulerFVMSolver.cpp](../src/EulerFVMSolver.cpp) |
 | Navier-Stokes solver | [NavierStokesFVMSolver.h](../include/NavierStokesFVMSolver.h) | [NavierStokesFVMSolver.cpp](../src/NavierStokesFVMSolver.cpp) |
-| RANS (Spalart-Allmaras) solver | [RANSFVMSolver.h](../include/RANSFVMSolver.h) | [RANSFVMSolver.cpp](../src/RANSFVMSolver.cpp) |
+| RANS (Spalart-Allmaras) solver | [RANSTurbulenceSASolver.h](../include/RANSTurbulenceSASolver.h) | [RANSTurbulenceSASolver.cpp](../src/RANSTurbulenceSASolver.cpp) |
 | SA turbulence model source terms | [SpalartAllmaras.h](../include/SpalartAllmaras.h) | [SpalartAllmaras.cpp](../src/SpalartAllmaras.cpp) |
+| RANS (k-omega SST) solver | [RANSTurbulenceSSTSolver.h](../include/RANSTurbulenceSSTSolver.h) | [RANSTurbulenceSSTSolver.cpp](../src/RANSTurbulenceSSTSolver.cpp) |
+| SST turbulence model source terms | [SSTKOmega.h](../include/SSTKOmega.h) | [SSTKOmega.cpp](../src/SSTKOmega.cpp) |
 | Wall-distance module (RANS) | [WallDistance.h](../include/WallDistance.h) | [WallDistance.cpp](../src/WallDistance.cpp) |
 | Wall diagnostics (forces/Cf/Cp/y+/boundary-layer thickness) | [WallTraction.h](../include/WallTraction.h) | [WallTraction.cpp](../src/WallTraction.cpp) |
 | Gradient reconstruction (shared) | [GradientReconstruction.h](../include/GradientReconstruction.h) | [GradientReconstruction.cpp](../src/GradientReconstruction.cpp) |
@@ -1124,5 +1389,6 @@ used in whatever order the reader produced it.
 | Deferred Euler viscosity discussion | [docs/euler-artificial-viscosity.md](euler-artificial-viscosity.md) | — |
 | Navier-Stokes development history (Phases 0-6) | [docs/navier-stokes-tracker.md](navier-stokes-tracker.md) | — |
 | RANS (Spalart-Allmaras) implementation history (archived; all phases closed — `CaseInput`/`main.cpp` wiring landed afterward, see [Solvers](#solvers)) | [docs/archive/rans-spalart-allmaras-tracker.md](archive/rans-spalart-allmaras-tracker.md) | — |
+| RANS (k-omega SST) implementation history (all 4 phases closed) | [docs/sst-komega-tracker.md](sst-komega-tracker.md) | — |
 | Deferred higher-order time/space scheme discussion | [docs/dns-higher-order-scheme-plan.md](dns-higher-order-scheme-plan.md) | — |
 | Wall diagnostics design + Phase 2 stress-test finding | [docs/wall-diagnostics-plan.md](wall-diagnostics-plan.md) | — |
