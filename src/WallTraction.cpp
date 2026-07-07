@@ -131,7 +131,7 @@ std::vector<WallFaceSample> compute_wall_traction(
         sample.p = p[cl];
         sample.rho = rho[cl];
         sample.effective_viscosity = mu;
-        sample.tau_wall = traction_x * tx + traction_y * ty;
+        sample.tau_wall = -(traction_x * tx + traction_y * ty);
         sample.tx = tx;
         sample.ty = ty;
         sample.y_wall_normal = face_normal_distance(mesh, face);
@@ -179,8 +179,8 @@ std::vector<WallForceReport> compute_wall_forces(const UnstructuredMesh& mesh,
         const Face& face = mesh.faces[s.face_index];
         double friction_x = face.area * s.tau_wall * s.tx;
         double friction_y = face.area * s.tau_wall * s.ty;
-        double pressure_x = face.area * -s.p * face.nx;
-        double pressure_y = face.area * -s.p * face.ny;
+        double pressure_x = face.area * s.p * face.nx;
+        double pressure_y = face.area * s.p * face.ny;
 
         double rx = s.x_mid - ref.moment_reference_x;
         double ry = s.y_mid - ref.moment_reference_y;

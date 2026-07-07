@@ -130,7 +130,7 @@ struct WallForceReport {
 // Sums, over 'samples' grouped by their face's patch_id (via
 // mesh.faces[sample.face_index].patch_id):
 //   friction_force = sum( face.area * tau_wall * (tx, ty) )
-//   pressure_force = sum( face.area * -p * (nx, ny) )   -- outward normal; force ON the wall from the fluid
+//   pressure_force = sum( face.area * p * (nx, ny) )   -- outward normal; force ON the wall from the fluid
 //   moment         = sum( r x (friction_force_i + pressure_force_i) ), r from ref.moment_reference_{x,y}
 // then projects the force onto ref's freestream direction for drag and its
 // perpendicular for lift.

@@ -893,7 +893,7 @@ bool run_verify_flat_plate_boundary_layer() {
     blasius_ref.velocity_y_ref = 0.0;
     double cf_computed = skin_friction_coefficient(exit_traction[0], blasius_ref);
     double cf_blasius = 0.664 / std::sqrt(Re_L);
-    double cf_rel_error = std::abs(std::fabs(cf_computed) - cf_blasius) / cf_blasius;
+    double cf_rel_error = std::abs(cf_computed - cf_blasius) / cf_blasius;
 
     double disp_ratio = exit_profile[0].displacement_thickness / delta99_general;
     double mom_ratio = exit_profile[0].momentum_thickness / delta99_general;
@@ -1148,7 +1148,7 @@ bool run_verify_sst_flat_plate() {
         blasius_ref.velocity_y_ref = 0.0;
         double cf_computed = skin_friction_coefficient(exit_traction[0], blasius_ref);
         double cf_blasius = 0.664 / std::sqrt(Re_L);
-        double cf_rel_error = std::abs(std::fabs(cf_computed) - cf_blasius) / cf_blasius;
+        double cf_rel_error = std::abs(cf_computed - cf_blasius) / cf_blasius;
 
         double disp_ratio = exit_profile[0].displacement_thickness / delta99_general;
         double mom_ratio = exit_profile[0].momentum_thickness / delta99_general;
@@ -2256,7 +2256,7 @@ bool run_verify_wall_forces() {
     for (const WallFaceSample& s : samples) {
         double cp = pressure_coefficient(s, ref);
         double yplus = wall_y_plus(s);
-        max_tau_rel_error = std::max(max_tau_rel_error, std::abs(std::fabs(s.tau_wall) - tau_exact) / tau_exact);
+        max_tau_rel_error = std::max(max_tau_rel_error, std::abs(s.tau_wall - tau_exact) / tau_exact);
         max_p_rel_error = std::max(max_p_rel_error, std::abs(s.p - p0) / p0);
         max_cp = std::max(max_cp, std::abs(cp));
         max_yplus_rel_error = std::max(max_yplus_rel_error, std::abs(yplus - yplus_exact) / yplus_exact);
@@ -2276,10 +2276,9 @@ bool run_verify_wall_forces() {
     // x = X + shear*Y, y = Y.
     double bottom_mid_x = 0.5, bottom_mid_y = 0.0;
     double top_mid_x = 0.5 + shear, top_mid_y = H;
-    double signed_tau = -tau_exact; // sign convention derived from this traction/tangent setup (see class comment)
     auto moment_of = [&](double mx, double my, double nx, double ny, double tx, double ty) {
         double rx = mx - ref.moment_reference_x, ry = my - ref.moment_reference_y;
-        double fx = signed_tau * tx + (-p0) * nx, fy = signed_tau * ty + (-p0) * ny;
+        double fx = tau_exact * tx + p0 * nx, fy = tau_exact * ty + p0 * ny;
         return rx * fy - ry * fx;
     };
     double moment_exact = moment_of(bottom_mid_x, bottom_mid_y, 0.0, -1.0, 1.0, 0.0) +
