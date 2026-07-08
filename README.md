@@ -1,6 +1,10 @@
 # FiniteVolume
 
-![NACA0012 at Mach 0.1](naca0012.png)
+<div align="center">
+  <img src="./naca0012.png" alt="NACA0012 at Mach 0.1" width="400">
+  <br>
+  <img src="./naca4412.png" alt="NACA4412 at Mach 0.85 5deg AoA" width="400">
+</div>
 
 A C++ standalone 2D unstructured finite-volume solver, with no external library
 dependencies. Solves scalar diffusion, advection-diffusion of a passive
