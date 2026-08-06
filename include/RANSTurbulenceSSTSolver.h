@@ -152,6 +152,21 @@ public:
         last_omega_residual = 0.0;
     }
 
+    // Mean-flow-only overload: overwrites U but leaves k/omega exactly as
+    // this solver's constructor already initialized them (uniform initial_k/
+    // initial_omega). Used when resuming from a checkpoint written by a
+    // different equation set/turbulence model (see Checkpoint::read_flow_field()
+    // and main.cpp's run_ransSST()) -- the flow field carries over, but k/omega
+    // restart fresh rather than from values that were never actually
+    // transported by SST.
+    void set_field(const std::vector<EulerState>& new_U) {
+        assert(new_U.size() == U.size());
+        U = new_U;
+        last_residual = EulerResidualNorms{};
+        last_k_residual = 0.0;
+        last_omega_residual = 0.0;
+    }
+
     // Overwrites the CFL number compute_dt() uses on the next step() call --
     // e.g. for residual-based CFL ramping (see CflRamp.h/main.cpp's cfl_mode
     // handling). Takes effect starting with the next step(), not retroactively.

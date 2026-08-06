@@ -116,6 +116,30 @@ namespace Checkpoint {
     bool read(const std::string& filename, CheckpointEquation expected_equation, size_t expected_cell_count,
               long long& out_step_index, unsigned long long& out_build_number, std::vector<EulerState>& out_U,
               std::vector<double>& out_k, std::vector<double>& out_omega);
+
+    // Reads just the mean-flow state (U), tolerating a checkpoint written by
+    // ANY of the "flow-field" equation sets (Euler, NavierStokes, RANS_SA,
+    // RANS_SST) instead of requiring one exact match -- every one of them
+    // writes U as the payload's first block (see the layout table above), so
+    // it can always be read back regardless of which model-specific scalars
+    // (nut, or k/omega) may follow it in the file. Used to let a Resume whose
+    // equation set/turbulence model changed since the checkpoint was written
+    // still continue the flow field, instead of failing outright (the caller
+    // then reinitializes any turbulence-model-specific scalars the new run
+    // needs from its own initial condition -- see main.cpp's run_ransSA()/
+    // run_ransSST() for the exact-match-vs-flow-only branch). Diffusion/
+    // AdvectionDiffusion checkpoints (whose payload isn't EulerState at all)
+    // are rejected, same as a cell-count mismatch or a corrupt/wrong-version
+    // file (a descriptive message is printed to stderr in every failure case
+    // except a plain open failure).
+    // Output: out_U               - the restored flow field, one entry per cell
+    //         out_source_equation - which equation set the checkpoint was
+    //                               actually written for (Euler/NavierStokes/
+    //                               RANS_SA/RANS_SST), so the caller can tell
+    //                               whether the model actually changed
+    bool read_flow_field(const std::string& filename, size_t expected_cell_count,
+                          long long& out_step_index, unsigned long long& out_build_number,
+                          std::vector<EulerState>& out_U, CheckpointEquation& out_source_equation);
 }
 
 #endif // CHECKPOINT_H_INCLUDED

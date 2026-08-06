@@ -3453,14 +3453,22 @@ bool run_euler(const CaseInput& case_input, const UnstructuredMesh& mesh) {
         long long resumed_step = 0;
         unsigned long long resumed_build = 0;
         std::vector<EulerState> resumed_field;
-        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::Euler,
-                               mesh.cells.size(), resumed_step, resumed_build, resumed_field)) {
+        CheckpointEquation source_equation;
+        // read_flow_field() tolerates a checkpoint written by any of the
+        // flow-field equation sets, not just an exact Euler match -- e.g.
+        // switching from Navier-Stokes back to Euler mid-pause still
+        // continues the flow field (see Checkpoint.h's contract).
+        if (!Checkpoint::read_flow_field(case_input.checkpoint_file, mesh.cells.size(), resumed_step,
+                                           resumed_build, resumed_field, source_equation)) {
             return false;
         }
         solver.set_field(resumed_field);
         resume_start = resumed_step + 1;
         std::cout << "Resuming from checkpoint at step " << resumed_step
                    << " (written by build " << resumed_build << ")\n";
+        if (source_equation != CheckpointEquation::Euler) {
+            std::cout << "Note: checkpoint was written for a different equation set; continuing the flow field.\n";
+        }
     }
 
     bool tracking_residual = !case_input.residual_file.empty();
@@ -3646,14 +3654,22 @@ bool run_navier_stokes(const CaseInput& case_input, const UnstructuredMesh& mesh
         long long resumed_step = 0;
         unsigned long long resumed_build = 0;
         std::vector<EulerState> resumed_field;
-        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::NavierStokes,
-                               mesh.cells.size(), resumed_step, resumed_build, resumed_field)) {
+        CheckpointEquation source_equation;
+        // read_flow_field() tolerates a checkpoint written by any of the
+        // flow-field equation sets, not just an exact NavierStokes match --
+        // e.g. switching Turbulence model to/from Laminar mid-pause still
+        // continues the flow field (see Checkpoint.h's contract).
+        if (!Checkpoint::read_flow_field(case_input.checkpoint_file, mesh.cells.size(), resumed_step,
+                                           resumed_build, resumed_field, source_equation)) {
             return false;
         }
         solver.set_field(resumed_field);
         resume_start = resumed_step + 1;
         std::cout << "Resuming from checkpoint at step " << resumed_step
                    << " (written by build " << resumed_build << ")\n";
+        if (source_equation != CheckpointEquation::NavierStokes) {
+            std::cout << "Note: checkpoint was written for a different equation set; continuing the flow field.\n";
+        }
     }
 
     bool tracking_residual = !case_input.residual_file.empty();
@@ -3920,12 +3936,30 @@ bool run_ransSA(const CaseInput& case_input, const UnstructuredMesh& mesh) {
         long long resumed_step = 0;
         unsigned long long resumed_build = 0;
         std::vector<EulerState> resumed_field;
-        std::vector<double> resumed_nut;
-        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS_SA, mesh.cells.size(), resumed_step,
-                               resumed_build, resumed_field, resumed_nut)) {
+        CheckpointEquation source_equation;
+        if (!Checkpoint::read_flow_field(case_input.checkpoint_file, mesh.cells.size(), resumed_step,
+                                           resumed_build, resumed_field, source_equation)) {
             return false;
         }
-        solver.set_field(resumed_field, resumed_nut);
+        if (source_equation == CheckpointEquation::RANS_SA) {
+            // Exact match -- re-read together with nut, in the dual-payload
+            // format this equation set's own write() actually uses (same
+            // file, same U/step/build as read_flow_field() already found).
+            std::vector<double> resumed_nut;
+            if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS_SA, mesh.cells.size(),
+                                   resumed_step, resumed_build, resumed_field, resumed_nut)) {
+                return false;
+            }
+            solver.set_field(resumed_field, resumed_nut);
+        } else {
+            // Checkpoint came from a different equation set/turbulence model
+            // -- continue the flow field only; nut stays at this run's own
+            // initial_nut (see RANSTurbulenceSASolver::set_field()'s
+            // mean-flow-only overload).
+            solver.set_field(resumed_field);
+            std::cout << "Note: checkpoint was written for a different equation set/turbulence model; "
+                          "continuing the flow field only, nut reinitialized from this run's own initial condition.\n";
+        }
         resume_start = resumed_step + 1;
         std::cout << "Resuming from checkpoint at step " << resumed_step
                    << " (written by build " << resumed_build << ")\n";
@@ -4222,12 +4256,31 @@ bool run_ransSST(const CaseInput& case_input, const UnstructuredMesh& mesh) {
         long long resumed_step = 0;
         unsigned long long resumed_build = 0;
         std::vector<EulerState> resumed_field;
-        std::vector<double> resumed_k, resumed_omega;
-        if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS_SST, mesh.cells.size(), resumed_step,
-                               resumed_build, resumed_field, resumed_k, resumed_omega)) {
+        CheckpointEquation source_equation;
+        if (!Checkpoint::read_flow_field(case_input.checkpoint_file, mesh.cells.size(), resumed_step,
+                                           resumed_build, resumed_field, source_equation)) {
             return false;
         }
-        solver.set_field(resumed_field, resumed_k, resumed_omega);
+        if (source_equation == CheckpointEquation::RANS_SST) {
+            // Exact match -- re-read together with k/omega, in the
+            // triple-payload format this equation set's own write() actually
+            // uses (same file, same U/step/build as read_flow_field() already
+            // found).
+            std::vector<double> resumed_k, resumed_omega;
+            if (!Checkpoint::read(case_input.checkpoint_file, CheckpointEquation::RANS_SST, mesh.cells.size(),
+                                   resumed_step, resumed_build, resumed_field, resumed_k, resumed_omega)) {
+                return false;
+            }
+            solver.set_field(resumed_field, resumed_k, resumed_omega);
+        } else {
+            // Checkpoint came from a different equation set/turbulence model
+            // -- continue the flow field only; k/omega stay at this run's own
+            // initial_k/initial_omega (see RANSTurbulenceSSTSolver::set_field()'s
+            // mean-flow-only overload).
+            solver.set_field(resumed_field);
+            std::cout << "Note: checkpoint was written for a different equation set/turbulence model; "
+                          "continuing the flow field only, k/omega reinitialized from this run's own initial condition.\n";
+        }
         resume_start = resumed_step + 1;
         std::cout << "Resuming from checkpoint at step " << resumed_step
                    << " (written by build " << resumed_build << ")\n";

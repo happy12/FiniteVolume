@@ -75,6 +75,32 @@ void compute_cell_geometry(UnstructuredMesh& mesh, int cell_index) {
     cell.y_centroid = cy;
 }
 
+// Proper-intersection test for two 2D segments a1-a2 and b1-b2.
+//
+// Methodology: standard orientation (cross-product sign) test -- the segments
+// cross iff a1/a2 lie strictly on opposite sides of line b1-b2 AND b1/b2 lie
+// strictly on opposite sides of line a1-a2. Strict inequalities make this a
+// *proper* intersection test: merely touching at an endpoint, or collinear
+// overlap, returns false. That is the wanted behavior for the polygon
+// self-intersection check below, whose caller only tests non-adjacent edge
+// pairs (adjacent edges always share a vertex, which is not a tangle).
+//
+// Input:   a1, a2 - endpoints of the first segment
+//          b1, b2 - endpoints of the second segment
+// Returns: true if the segments cross at a point interior to both
+bool segments_properly_intersect(const Node& a1, const Node& a2,
+                                 const Node& b1, const Node& b2) {
+    auto side = [](const Node& o, const Node& p, const Node& q) {
+        return (p.x - o.x) * (q.y - o.y) - (p.y - o.y) * (q.x - o.x);
+    };
+    const double d1 = side(b1, b2, a1);
+    const double d2 = side(b1, b2, a2);
+    const double d3 = side(a1, a2, b1);
+    const double d4 = side(a1, a2, b2);
+    return ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
+           ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0));
+}
+
 // Validates basic mesh geometry once nodes/cells/faces are built, catching
 // the failure mode CLAUDE.md documents as a known gap: a degenerate mesh
 // (collinear/coincident cell vertices, a zero-length face) otherwise loads
@@ -145,9 +171,14 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh, MeshCheckReport* repor
         }
     }
 
-    // Cell volumes: exactly zero/non-finite (a fully collinear/collapsed
-    // polygon) is a hard error; merely very small relative to the mesh's own
-    // mean cell volume is only a warning.
+    // Cell volumes: checked on the SIGNED shoelace area (cell.volume itself
+    // is fabs()'d by compute_cell_geometry, which would mask an inverted
+    // cell). Negative means clockwise winding -- both mesh formats require
+    // CCW cells, and UnstructuredMesh::compute_geometry derives every face's
+    // outward normal purely from that winding, so an inverted cell gets all
+    // its face normals pointing inward and silently wrong fluxes. Negative
+    // and exactly zero/non-finite are hard errors; merely very small
+    // relative to the mesh's own mean cell volume is only a warning.
     double volume_sum = 0.0;
     int finite_volume_count = 0;
     for (const Cell& cell : mesh.cells) {
@@ -160,11 +191,18 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh, MeshCheckReport* repor
 
     for (size_t c = 0; c < mesh.cells.size(); ++c) {
         double volume = mesh.cells[c].volume;
-        if (!std::isfinite(volume) || volume <= 0.0) {
-            std::cerr << "Error: cell " << c << " has a degenerate (zero or non-finite) volume ("
-                       << volume << ") -- its polygon vertices are collinear or coincident\n";
+        double signed_area = polygon_signed_area(mesh, mesh.cells[c].node_ids);
+        if (!std::isfinite(signed_area) || signed_area < 0.0) {
+            std::cerr << "Error: cell " << c << " has a negative (or non-finite) signed volume ("
+                       << signed_area << ") -- its vertices wind clockwise (inverted cell), so "
+                       << "its face normals would point inward\n";
             ok = false;
-            if (report) report->add_issue(2, {"error", "cell", (int)c, "cell_volume_positive", volume});
+            if (report) report->add_issue(2, {"error", "cell", (int)c, "cell_volume_positive", signed_area});
+        } else if (signed_area == 0.0) {
+            std::cerr << "Error: cell " << c << " has a degenerate (zero) volume -- its polygon "
+                       << "vertices are collinear or coincident\n";
+            ok = false;
+            if (report) report->add_issue(2, {"error", "cell", (int)c, "cell_volume_positive", signed_area});
         } else if (mean_volume > 0.0 && volume < 1e-8 * mean_volume) {
             std::cerr << "Warning: cell " << c << " has volume " << volume
                        << ", far smaller than the mesh's mean cell volume (" << mean_volume
@@ -172,6 +210,31 @@ bool validate_mesh_geometry(const UnstructuredMesh& mesh, MeshCheckReport* repor
             if (report) {
                 report->add_issue(2, {"warning", "cell", (int)c, "cell_volume_not_near_degenerate", volume});
             }
+        }
+
+        // Self-intersection (a "bowtie"/tangled polygon, the other tangled-
+        // mesh symptom besides inverted winding above -- a bowtie's shoelace
+        // area partially cancels and can still come out positive): test every
+        // pair of non-adjacent edges for a proper crossing. O(k^2) in the
+        // cell's edge count k, which is 4 for this pipeline's quads -- 2
+        // pairs per cell. The issue value is the number of crossing edge
+        // pairs found.
+        const std::vector<int>& ids = mesh.cells[c].node_ids;
+        const int n_edges = (int)ids.size();
+        int crossings = 0;
+        for (int i = 0; i < n_edges; ++i) {
+            for (int j = i + 2; j < n_edges; ++j) {
+                if (i == 0 && j == n_edges - 1) continue;   // adjacent via the wrap-around edge
+                if (segments_properly_intersect(mesh.nodes[ids[i]], mesh.nodes[ids[(i + 1) % n_edges]],
+                                                mesh.nodes[ids[j]], mesh.nodes[ids[(j + 1) % n_edges]]))
+                    ++crossings;
+            }
+        }
+        if (crossings > 0) {
+            std::cerr << "Error: cell " << c << " is self-intersecting (" << crossings
+                       << " edge pair(s) cross) -- a tangled/bowtie polygon\n";
+            ok = false;
+            if (report) report->add_issue(2, {"error", "cell", (int)c, "cell_self_intersection", (double)crossings});
         }
     }
 

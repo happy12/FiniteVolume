@@ -66,6 +66,34 @@ void write_header_and_payload(std::ofstream& out, CheckpointEquation equation, l
     out.write(reinterpret_cast<const char*>(payload), payload_size);
 }
 
+// Reads and validates just the fixed-size header's magic/version (the parts
+// every checkpoint agrees on regardless of which equation set wrote it) --
+// shared by read_and_validate_header() (exact equation match) and
+// read_flow_field() (equation-family match) below, which each apply their
+// own equation-tag check afterward.
+// Input:  in       - open binary input stream
+//         filename - path, for diagnostics only
+// Output: out_header - the raw header, if well-formed
+// Returns: true if the header is well-formed; false otherwise (a descriptive
+//          message is printed to stderr)
+bool read_raw_header(std::ifstream& in, const std::string& filename, Header& out_header) {
+    in.read(reinterpret_cast<char*>(&out_header), sizeof(out_header));
+    if (!in) {
+        std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short header)\n";
+        return false;
+    }
+    if (std::memcmp(out_header.magic, MAGIC, sizeof(MAGIC)) != 0) {
+        std::cerr << "Checkpoint file '" << filename << "' is not a valid FiniteVolume checkpoint (bad magic)\n";
+        return false;
+    }
+    if (out_header.version != FORMAT_VERSION) {
+        std::cerr << "Checkpoint file '" << filename << "' has unsupported version " << out_header.version
+                   << " (expected " << FORMAT_VERSION << ")\n";
+        return false;
+    }
+    return true;
+}
+
 // Reads and validates the fixed-size header against the caller's expectations.
 // Input:  in                  - open binary input stream
 //         filename            - path, for diagnostics only
@@ -79,20 +107,7 @@ bool read_and_validate_header(std::ifstream& in, const std::string& filename,
                                CheckpointEquation expected_equation, size_t expected_cell_count,
                                long long& out_step_index, unsigned long long& out_build_number) {
     Header header;
-    in.read(reinterpret_cast<char*>(&header), sizeof(header));
-    if (!in) {
-        std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short header)\n";
-        return false;
-    }
-    if (std::memcmp(header.magic, MAGIC, sizeof(MAGIC)) != 0) {
-        std::cerr << "Checkpoint file '" << filename << "' is not a valid FiniteVolume checkpoint (bad magic)\n";
-        return false;
-    }
-    if (header.version != FORMAT_VERSION) {
-        std::cerr << "Checkpoint file '" << filename << "' has unsupported version " << header.version
-                   << " (expected " << FORMAT_VERSION << ")\n";
-        return false;
-    }
+    if (!read_raw_header(in, filename, header)) return false;
     if (header.equation != static_cast<uint32_t>(expected_equation)) {
         std::cerr << "Checkpoint file '" << filename
                    << "' was written for a different equation set than the current run\n";
@@ -107,6 +122,21 @@ bool read_and_validate_header(std::ifstream& in, const std::string& filename,
     out_step_index = header.step_index;
     out_build_number = header.build_number;
     return true;
+}
+
+// See Checkpoint::read_flow_field()'s contract -- true for every equation set
+// whose payload starts with a plain EulerState array (i.e. every one except
+// Diffusion/AdvectionDiffusion, whose payload is a scalar phi array instead).
+bool is_flow_field_equation(uint32_t tag) {
+    switch (static_cast<CheckpointEquation>(tag)) {
+        case CheckpointEquation::Euler:
+        case CheckpointEquation::NavierStokes:
+        case CheckpointEquation::RANS_SA:
+        case CheckpointEquation::RANS_SST:
+            return true;
+        default:
+            return false;
+    }
 }
 
 } // namespace
@@ -257,6 +287,43 @@ bool Checkpoint::read(const std::string& filename, CheckpointEquation expected_e
 
     out_omega.resize(expected_cell_count);
     in.read(reinterpret_cast<char*>(out_omega.data()), out_omega.size() * sizeof(double));
+    if (!in) {
+        std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short payload)\n";
+        return false;
+    }
+    return true;
+}
+
+// See Checkpoint.h for the input/output contract.
+bool Checkpoint::read_flow_field(const std::string& filename, size_t expected_cell_count,
+                                  long long& out_step_index, unsigned long long& out_build_number,
+                                  std::vector<EulerState>& out_U, CheckpointEquation& out_source_equation) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+
+    Header header;
+    if (!read_raw_header(in, filename, header)) {
+        return false;
+    }
+    if (!is_flow_field_equation(header.equation)) {
+        std::cerr << "Checkpoint file '" << filename
+                   << "' does not contain a flow field (written by a Diffusion/AdvectionDiffusion run)\n";
+        return false;
+    }
+    if (header.cell_count != expected_cell_count) {
+        std::cerr << "Checkpoint file '" << filename << "' has " << header.cell_count
+                   << " cells but the current mesh has " << expected_cell_count << " cells (mesh changed?)\n";
+        return false;
+    }
+
+    out_step_index = header.step_index;
+    out_build_number = header.build_number;
+    out_source_equation = static_cast<CheckpointEquation>(header.equation);
+
+    out_U.resize(expected_cell_count);
+    in.read(reinterpret_cast<char*>(out_U.data()), out_U.size() * sizeof(EulerState));
     if (!in) {
         std::cerr << "Checkpoint file '" << filename << "' is truncated or corrupt (short payload)\n";
         return false;
